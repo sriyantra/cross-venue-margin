@@ -4,7 +4,8 @@
 //! `Engine` is pure. It has no I/O, no async and no clock: every method
 //! takes the time as an argument and returns the events it caused. Feeding
 //! the same calls in the same order always produces the same events, which
-//! is what makes a recorded run replayable. `task` wraps it in a Tokio task.
+//! is what makes a recorded run replayable. `restore` rebuilds an engine
+//! from the events an earlier one emitted. `task` wraps it in a Tokio task.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -18,7 +19,10 @@ use crate::risk::{
     RiskError, Schedule, Side, Thresholds, account_health, liquidation_price, step,
 };
 
+pub mod restore;
 pub mod task;
+
+pub use restore::RestoreError;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -32,7 +36,7 @@ impl fmt::Display for AccountId {
 
 /// Something that happened to an account. These are the facts a log has to
 /// keep: none of them can be recomputed from the others.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Event {
     AccountOpened {

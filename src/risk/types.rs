@@ -28,7 +28,7 @@ impl fmt::Display for Venue {
 }
 
 /// One market on one venue. The same coin on two venues is two markets.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct MarketId {
     pub venue: Venue,
     pub coin: String,
