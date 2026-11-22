@@ -75,9 +75,9 @@ Environment:
 | Route              | Returns                                              |
 | ------------------ | ---------------------------------------------------- |
 | `GET /health`      | Per-market liveness and age. 503 if any book or mark is stale |
-| `GET /book/{coin}` | The current book. 503 with `{"type":"stale"}` if not live |
-| `GET /mark/{coin}` | The venue's mark price. 503 with `{"type":"stale"}` if not live |
-| `GET /ws/{coin}`   | WebSocket: the current book, then every update       |
+| `GET /book/{venue}/{coin}` | The current book. 503 with `{"type":"stale"}` if not live |
+| `GET /mark/{venue}/{coin}` | The venue's mark price. 503 with `{"type":"stale"}` if not live |
+| `GET /ws/{venue}/{coin}`   | WebSocket: the current book, then every update |
 
 | `POST /accounts`            | Open a paper account. Body: `{"collateral":"5000"}` |
 | `GET /accounts/{id}`        | State, health, and positions with liquidation prices |
@@ -86,7 +86,7 @@ Environment:
 Amounts are JSON strings, so no value passes through a binary float.
 
 ```sh
-curl -s localhost:8080/book/BTC
+curl -s localhost:8080/book/hyperliquid/BTC
 curl -s -H 'content-type: application/json' -d '{"collateral":"5000"}' localhost:8080/accounts
 curl -s -H 'content-type: application/json' \
   -d '{"venue":"hyperliquid","coin":"BTC","side":"long","size":"0.5"}' \

@@ -2,3 +2,4 @@
 //! wire format into `book` operations and publishes `feed::BookView`s.
 
 pub mod hyperliquid;
+mod market;

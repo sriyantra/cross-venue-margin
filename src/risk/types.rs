@@ -15,12 +15,14 @@ use super::num::{add, div, mul, sub};
 #[serde(rename_all = "snake_case")]
 pub enum Venue {
     Hyperliquid,
+    Okx,
 }
 
 impl fmt::Display for Venue {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Venue::Hyperliquid => f.write_str("hyperliquid"),
+            Venue::Okx => f.write_str("okx"),
         }
     }
 }

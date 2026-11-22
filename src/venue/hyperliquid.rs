@@ -11,7 +11,6 @@
 
 use std::collections::HashMap;
 use std::io::Read;
-use std::sync::Arc;
 use std::time::Duration;
 
 use base64::Engine;
@@ -27,23 +26,18 @@ use tokio_tungstenite::tungstenite::{self, Message};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
-use crate::book::{Book, Desync, Level, SideDiff};
-use crate::feed::{BookView, MarkView, Publisher};
-use crate::risk::TierTable;
+use super::market::{MARK_CHECK_EVERY, Market};
+use crate::book::{Desync, Level, SideDiff};
+use crate::feed::Publisher;
+use crate::risk::{TierTable, Venue};
 
-pub const VENUE: &str = "hyperliquid";
+const VENUE: Venue = Venue::Hyperliquid;
 
 /// How often to send an application-level ping.
 const PING_EVERY: Duration = Duration::from_secs(5);
 /// If no frame of any kind arrives for this long, treat the connection as
 /// dead even if the socket still looks open.
 const STALE_AFTER: Duration = Duration::from_secs(10);
-/// A mark price that has not been refreshed for this long is withdrawn.
-const MARK_STALE_AFTER: Duration = Duration::from_secs(10);
-/// How often to look for marks that have gone stale.
-const MARK_CHECK_EVERY: Duration = Duration::from_secs(1);
-/// Minimum gap between resubscribes for one market.
-const RESYNC_THROTTLE: Duration = Duration::from_secs(1);
 const BACKOFF_START: Duration = Duration::from_millis(500);
 const BACKOFF_MAX: Duration = Duration::from_secs(30);
 /// Upper bound on one decompressed diff. Real diffs are a few kilobytes.
@@ -259,79 +253,6 @@ enum SessionEnd {
     Shutdown,
 }
 
-/// One market's state inside the connector task.
-struct Market {
-    book: Book,
-    publisher: Publisher,
-    last_resync: Option<Instant>,
-    /// When the current mark arrived. `None` while no mark is published.
-    last_mark: Option<Instant>,
-}
-
-impl Market {
-    fn new(coin: String, publisher: Publisher) -> Self {
-        Self {
-            book: Book::new(coin),
-            publisher,
-            last_resync: None,
-            last_mark: None,
-        }
-    }
-
-    fn publish(&self) {
-        let view = BookView::from_book(VENUE, &self.book).map(Arc::new);
-        // `send_replace` stores the value even when nobody is listening yet.
-        self.publisher.book.send_replace(view);
-    }
-
-    fn invalidate(&mut self) {
-        self.book.reset();
-        self.publisher.book.send_replace(None);
-    }
-
-    /// Publishes a mark. The venue repeats an unchanged mark about once a
-    /// second, so readers are only woken when the price is different.
-    fn set_mark(&mut self, mark: Decimal, now: Instant) {
-        if mark <= Decimal::ZERO {
-            warn!(venue = VENUE, coin = self.book.coin(), %mark, "mark is not a price");
-            self.invalidate_mark();
-            return;
-        }
-        self.last_mark = Some(now);
-        let view = MarkView {
-            venue: VENUE,
-            coin: self.book.coin().to_string(),
-            mark,
-        };
-        self.publisher.mark.send_if_modified(|slot| {
-            if slot.as_ref() == Some(&view) {
-                return false;
-            }
-            *slot = Some(view);
-            true
-        });
-    }
-
-    fn invalidate_mark(&mut self) {
-        self.last_mark = None;
-        self.publisher
-            .mark
-            .send_if_modified(|slot| slot.take().is_some());
-    }
-
-    /// Withdraws a mark the venue has stopped refreshing. Returns whether it
-    /// did.
-    fn expire_mark(&mut self, now: Instant) -> bool {
-        let stale = self
-            .last_mark
-            .is_some_and(|at| now.duration_since(at) >= MARK_STALE_AFTER);
-        if stale {
-            self.invalidate_mark();
-        }
-        stale
-    }
-}
-
 /// Runs the connector until `shutdown` is cancelled.
 ///
 /// Reconnects forever with exponential backoff. Every reconnect starts from
@@ -340,7 +261,7 @@ impl Market {
 pub async fn run(url: String, publishers: HashMap<String, Publisher>, shutdown: CancellationToken) {
     let mut markets: HashMap<String, Market> = publishers
         .into_iter()
-        .map(|(coin, publisher)| (coin.clone(), Market::new(coin, publisher)))
+        .map(|(coin, publisher)| (coin.clone(), Market::new(VENUE, coin, publisher)))
         .collect();
 
     let mut backoff = BACKOFF_START;
@@ -355,10 +276,10 @@ pub async fn run(url: String, publishers: HashMap<String, Publisher>, shutdown: 
 
         match outcome {
             Ok(SessionEnd::Shutdown) => {
-                info!(venue = VENUE, "connector stopped");
+                info!(venue = %VENUE, "connector stopped");
                 return;
             }
-            Err(error) => warn!(venue = VENUE, %error, "session ended"),
+            Err(error) => warn!(venue = %VENUE, %error, "session ended"),
         }
 
         // A session that got as far as a snapshot was healthy, so the next
@@ -366,7 +287,7 @@ pub async fn run(url: String, publishers: HashMap<String, Publisher>, shutdown: 
         if got_snapshot {
             backoff = BACKOFF_START;
         }
-        info!(venue = VENUE, delay = ?backoff, "reconnecting");
+        info!(venue = %VENUE, delay = ?backoff, "reconnecting");
         tokio::select! {
             _ = shutdown.cancelled() => return,
             _ = tokio::time::sleep(backoff) => {}
@@ -398,7 +319,7 @@ async fn session(
         _ = shutdown.cancelled() => return Ok(SessionEnd::Shutdown),
         connected = tokio_tungstenite::connect_async(url) => connected?,
     };
-    info!(venue = VENUE, url, "connected");
+    info!(venue = %VENUE, url, "connected");
 
     for coin in markets.keys() {
         ws.send(subscription("subscribe", coin)).await?;
@@ -428,7 +349,7 @@ async fn session(
                 let now = Instant::now();
                 for (coin, market) in markets.iter_mut() {
                     if market.expire_mark(now) {
-                        warn!(venue = VENUE, coin, "mark went stale");
+                        warn!(venue = %VENUE, coin, "mark went stale");
                     }
                 }
             }
@@ -465,7 +386,7 @@ fn handle_text(
         Err(error) => {
             // The coin is inside the payload that failed to decode, so there
             // is no way to know which book just missed an update. Rebuild all.
-            warn!(venue = VENUE, %error, "undecodable frame, resyncing every market");
+            warn!(venue = %VENUE, %error, "undecodable frame, resyncing every market");
             return markets
                 .iter_mut()
                 .filter_map(|(coin, market)| {
@@ -490,11 +411,11 @@ fn handle_text(
                 Ok(()) => {
                     *got_snapshot = true;
                     market.publish();
-                    debug!(venue = VENUE, coin, "snapshot applied");
+                    debug!(venue = %VENUE, coin, "snapshot applied");
                     Vec::new()
                 }
                 Err(error) => {
-                    warn!(venue = VENUE, coin, %error, "snapshot rejected");
+                    warn!(venue = %VENUE, coin, %error, "snapshot rejected");
                     resync(&coin, market).into_iter().collect()
                 }
             }
@@ -517,7 +438,7 @@ fn handle_text(
                 // old subscription keep arriving until the new snapshot lands.
                 Err(Desync::NoSnapshot) => Vec::new(),
                 Err(error) => {
-                    warn!(venue = VENUE, coin, %error, "book desynced");
+                    warn!(venue = %VENUE, coin, %error, "book desynced");
                     resync(&coin, market).into_iter().collect()
                 }
             }
@@ -529,25 +450,16 @@ fn handle_text(
             Vec::new()
         }
         Event::VenueError(message) => {
-            warn!(venue = VENUE, message, "venue reported an error");
+            warn!(venue = %VENUE, message, "venue reported an error");
             Vec::new()
         }
         Event::Pong | Event::Subscribed | Event::Ignored(_) => Vec::new(),
     }
 }
 
-/// Clears one market and reports whether a resubscribe should be sent now.
+/// Clears one market and names it if a resubscribe should be sent now.
 fn resync(coin: &str, market: &mut Market) -> Option<String> {
-    market.invalidate();
-    let now = Instant::now();
-    if market
-        .last_resync
-        .is_some_and(|at| now.duration_since(at) < RESYNC_THROTTLE)
-    {
-        return None;
-    }
-    market.last_resync = Some(now);
-    Some(coin.to_string())
+    market.resync().then(|| coin.to_string())
 }
 
 #[cfg(test)]
@@ -655,54 +567,6 @@ mod tests {
                 mark: dec!(60787.0)
             }
         );
-    }
-
-    fn market() -> (Market, crate::feed::MarkRx) {
-        let (feeds, mut publishers) = crate::feed::Feeds::channels(&["BTC".to_string()]);
-        let market = Market::new("BTC".into(), publishers.remove("BTC").unwrap());
-        (market, feeds.subscribe_mark("BTC").unwrap())
-    }
-
-    #[test]
-    fn unchanged_mark_does_not_wake_readers() {
-        let (mut market, mut rx) = market();
-        let now = Instant::now();
-
-        market.set_mark(dec!(100), now);
-        assert!(rx.has_changed().unwrap());
-        assert_eq!(rx.borrow_and_update().as_ref().unwrap().mark, dec!(100));
-
-        market.set_mark(dec!(100), now);
-        assert!(!rx.has_changed().unwrap());
-
-        market.set_mark(dec!(101), now);
-        assert!(rx.has_changed().unwrap());
-    }
-
-    #[test]
-    fn mark_expires_when_the_venue_stops_refreshing_it() {
-        let (mut market, rx) = market();
-        let start = Instant::now();
-        market.set_mark(dec!(100), start);
-
-        assert!(!market.expire_mark(start + MARK_STALE_AFTER - Duration::from_millis(1)));
-        assert!(rx.borrow().is_some());
-
-        // A repeat of the same price still counts as a refresh.
-        market.set_mark(dec!(100), start + Duration::from_secs(5));
-        assert!(!market.expire_mark(start + MARK_STALE_AFTER));
-
-        assert!(market.expire_mark(start + Duration::from_secs(5) + MARK_STALE_AFTER));
-        assert!(rx.borrow().is_none());
-        assert!(!market.expire_mark(start + Duration::from_secs(60)));
-    }
-
-    #[test]
-    fn non_positive_mark_withdraws_the_mark() {
-        let (mut market, rx) = market();
-        market.set_mark(dec!(100), Instant::now());
-        market.set_mark(dec!(0), Instant::now());
-        assert!(rx.borrow().is_none());
     }
 
     #[test]

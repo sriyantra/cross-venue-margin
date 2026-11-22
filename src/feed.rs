@@ -8,7 +8,7 @@
 //! change. A slow reader never builds a queue: it just skips straight to the
 //! newest value, which is the only one worth acting on.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use rust_decimal::Decimal;
@@ -16,11 +16,13 @@ use serde::Serialize;
 use tokio::sync::watch;
 
 use crate::book::{Book, Level};
+use crate::risk::{MarketId, Venue};
 
 /// An immutable copy of a book at one moment, in a venue-neutral shape.
+/// Sizes are in units of the coin on every venue.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct BookView {
-    pub venue: &'static str,
+    pub venue: Venue,
     pub coin: String,
     /// Venue timestamp of the last applied message, in milliseconds.
     pub time: u64,
@@ -32,7 +34,7 @@ pub struct BookView {
 impl BookView {
     /// Copies a live book. Returns `None` for a book that is waiting for a
     /// snapshot, so stale state cannot be published by accident.
-    pub fn from_book(venue: &'static str, book: &Book) -> Option<Self> {
+    pub fn from_book(venue: Venue, book: &Book) -> Option<Self> {
         Some(Self {
             venue,
             coin: book.coin().to_string(),
@@ -54,7 +56,7 @@ pub type BookRx = watch::Receiver<Slot>;
 /// uses for margin and liquidation, which is not the book's mid.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct MarkView {
-    pub venue: &'static str,
+    pub venue: Venue,
     pub coin: String,
     pub mark: Decimal,
 }
@@ -72,53 +74,71 @@ pub struct Publisher {
     pub mark: MarkTx,
 }
 
+/// Write sides for every market, grouped by the venue whose connector will
+/// own them and keyed by coin.
+#[derive(Debug, Default)]
+pub struct Publishers {
+    by_venue: HashMap<Venue, HashMap<String, Publisher>>,
+}
+
+impl Publishers {
+    /// Hands one venue's publishers to its connector. A second call for the
+    /// same venue returns an empty map.
+    pub fn take(&mut self, venue: Venue) -> HashMap<String, Publisher> {
+        self.by_venue.remove(&venue).unwrap_or_default()
+    }
+}
+
 /// Read side: one receiver pair per market, shared by the API handlers.
 #[derive(Debug, Clone, Default)]
 pub struct Feeds {
-    books: HashMap<String, BookRx>,
-    marks: HashMap<String, MarkRx>,
+    books: BTreeMap<MarketId, BookRx>,
+    marks: BTreeMap<MarketId, MarkRx>,
 }
 
 impl Feeds {
-    /// Creates the channels for each coin. Returns the read side and the
+    /// Creates the channels for each market. Returns the read side and the
     /// write side separately so each can be moved into the task that owns it.
-    pub fn channels(coins: &[String]) -> (Self, HashMap<String, Publisher>) {
+    pub fn channels(markets: &[MarketId]) -> (Self, Publishers) {
         let mut feeds = Self::default();
-        let mut publishers = HashMap::new();
-        for coin in coins {
+        let mut publishers = Publishers::default();
+        for market in markets {
             let (book, book_rx) = watch::channel(None);
             let (mark, mark_rx) = watch::channel(None);
-            publishers.insert(coin.clone(), Publisher { book, mark });
-            feeds.books.insert(coin.clone(), book_rx);
-            feeds.marks.insert(coin.clone(), mark_rx);
+            publishers
+                .by_venue
+                .entry(market.venue)
+                .or_default()
+                .insert(market.coin.clone(), Publisher { book, mark });
+            feeds.books.insert(market.clone(), book_rx);
+            feeds.marks.insert(market.clone(), mark_rx);
         }
         (feeds, publishers)
     }
 
-    pub fn subscribe(&self, coin: &str) -> Option<BookRx> {
-        self.books.get(coin).cloned()
+    pub fn subscribe(&self, market: &MarketId) -> Option<BookRx> {
+        self.books.get(market).cloned()
     }
 
-    pub fn latest(&self, coin: &str) -> Option<Slot> {
-        self.books.get(coin).map(|rx| rx.borrow().clone())
+    pub fn latest(&self, market: &MarketId) -> Option<Slot> {
+        self.books.get(market).map(|rx| rx.borrow().clone())
     }
 
-    pub fn subscribe_mark(&self, coin: &str) -> Option<MarkRx> {
-        self.marks.get(coin).cloned()
+    pub fn subscribe_mark(&self, market: &MarketId) -> Option<MarkRx> {
+        self.marks.get(market).cloned()
     }
 
-    pub fn latest_mark(&self, coin: &str) -> Option<MarkSlot> {
-        self.marks.get(coin).map(|rx| rx.borrow().clone())
+    pub fn latest_mark(&self, market: &MarketId) -> Option<MarkSlot> {
+        self.marks.get(market).map(|rx| rx.borrow().clone())
     }
 
     /// Every market's mark receiver, for a task that watches all of them.
-    pub fn mark_receivers(&self) -> impl Iterator<Item = (&str, MarkRx)> {
-        self.marks
-            .iter()
-            .map(|(coin, rx)| (coin.as_str(), rx.clone()))
+    pub fn mark_receivers(&self) -> impl Iterator<Item = (&MarketId, MarkRx)> {
+        self.marks.iter().map(|(market, rx)| (market, rx.clone()))
     }
 
-    pub fn coins(&self) -> impl Iterator<Item = &str> {
-        self.books.keys().map(String::as_str)
+    /// Every tracked market, ordered by venue then coin.
+    pub fn markets(&self) -> impl Iterator<Item = &MarketId> {
+        self.books.keys()
     }
 }

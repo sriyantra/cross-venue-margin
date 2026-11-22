@@ -1,9 +1,9 @@
 //! HTTP and WebSocket API.
 //!
-//! - `GET /health`       liveness of every tracked market
-//! - `GET /book/{coin}`  the current book, once
-//! - `GET /mark/{coin}`  the venue's current mark price
-//! - `GET /ws/{coin}`    WebSocket: the current book, then every update
+//! - `GET /health`               liveness of every tracked market
+//! - `GET /book/{venue}/{coin}`  the current book, once
+//! - `GET /mark/{venue}/{coin}`  the venue's current mark price
+//! - `GET /ws/{venue}/{coin}`    WebSocket: the current book, then every update
 //! - `POST /accounts`             open a paper account
 //! - `GET /accounts/{id}`         health, state and positions
 //! - `POST /accounts/{id}/fills`  fill a paper order at the mark
@@ -82,15 +82,16 @@ enum BookMessage<'a> {
     /// The book is not trustworthy right now. Clients must stop using the
     /// last book they received.
     Stale {
-        coin: &'a str,
+        #[serde(flatten)]
+        market: &'a MarketId,
     },
 }
 
 impl<'a> BookMessage<'a> {
-    fn new(coin: &'a str, slot: &'a Slot) -> Self {
+    fn new(market: &'a MarketId, slot: &'a Slot) -> Self {
         match slot {
             Some(view) => Self::Book(view),
-            None => Self::Stale { coin },
+            None => Self::Stale { market },
         }
     }
 }
@@ -100,12 +101,16 @@ impl<'a> BookMessage<'a> {
 #[serde(tag = "type", rename_all = "snake_case")]
 enum MarkMessage<'a> {
     Mark(&'a MarkView),
-    Stale { coin: &'a str },
+    Stale {
+        #[serde(flatten)]
+        market: &'a MarketId,
+    },
 }
 
 #[derive(Debug, Serialize)]
 struct MarketHealth {
-    coin: String,
+    #[serde(flatten)]
+    market: MarketId,
     live: bool,
     mark_live: bool,
     /// Milliseconds between the venue timestamp of the last applied message
@@ -122,9 +127,9 @@ struct Health {
 pub fn router(feeds: Feeds, engine: EngineHandle) -> Router {
     Router::new()
         .route("/health", get(health))
-        .route("/book/{coin}", get(book))
-        .route("/mark/{coin}", get(mark))
-        .route("/ws/{coin}", get(ws_upgrade))
+        .route("/book/{venue}/{coin}", get(book))
+        .route("/mark/{venue}/{coin}", get(mark))
+        .route("/ws/{venue}/{coin}", get(ws_upgrade))
         .route("/accounts", post(create_account))
         .route("/accounts/{id}", get(account))
         .route("/accounts/{id}/fills", post(fill))
@@ -158,19 +163,18 @@ fn now_ms() -> u64 {
 
 async fn health(State(feeds): State<Arc<Feeds>>) -> Response {
     let now = now_ms();
-    let mut markets: Vec<MarketHealth> = feeds
-        .coins()
-        .map(|coin| {
-            let slot = feeds.latest(coin).flatten();
+    let markets: Vec<MarketHealth> = feeds
+        .markets()
+        .map(|market| {
+            let slot = feeds.latest(market).flatten();
             MarketHealth {
-                coin: coin.to_string(),
+                market: market.clone(),
                 live: slot.is_some(),
-                mark_live: feeds.latest_mark(coin).flatten().is_some(),
+                mark_live: feeds.latest_mark(market).flatten().is_some(),
                 age_ms: slot.map(|view| now.saturating_sub(view.time)),
             }
         })
         .collect();
-    markets.sort_by(|a, b| a.coin.cmp(&b.coin));
 
     let ok = markets.iter().all(|m| m.live && m.mark_live);
     let status = if ok {
@@ -181,8 +185,12 @@ async fn health(State(feeds): State<Arc<Feeds>>) -> Response {
     (status, Json(Health { ok, markets })).into_response()
 }
 
-async fn book(State(feeds): State<Arc<Feeds>>, Path(coin): Path<String>) -> Response {
-    match feeds.latest(&coin) {
+async fn book(
+    State(feeds): State<Arc<Feeds>>,
+    Path((venue, coin)): Path<(Venue, String)>,
+) -> Response {
+    let market = MarketId::new(venue, coin);
+    match feeds.latest(&market) {
         None => (StatusCode::NOT_FOUND, "unknown market").into_response(),
         Some(slot) => {
             let status = if slot.is_some() {
@@ -190,18 +198,22 @@ async fn book(State(feeds): State<Arc<Feeds>>, Path(coin): Path<String>) -> Resp
             } else {
                 StatusCode::SERVICE_UNAVAILABLE
             };
-            (status, Json(BookMessage::new(&coin, &slot))).into_response()
+            (status, Json(BookMessage::new(&market, &slot))).into_response()
         }
     }
 }
 
-async fn mark(State(feeds): State<Arc<Feeds>>, Path(coin): Path<String>) -> Response {
-    match feeds.latest_mark(&coin) {
+async fn mark(
+    State(feeds): State<Arc<Feeds>>,
+    Path((venue, coin)): Path<(Venue, String)>,
+) -> Response {
+    let market = MarketId::new(venue, coin);
+    match feeds.latest_mark(&market) {
         None => (StatusCode::NOT_FOUND, "unknown market").into_response(),
         Some(Some(view)) => Json(MarkMessage::Mark(&view)).into_response(),
         Some(None) => (
             StatusCode::SERVICE_UNAVAILABLE,
-            Json(MarkMessage::Stale { coin: &coin }),
+            Json(MarkMessage::Stale { market: &market }),
         )
             .into_response(),
     }
@@ -258,17 +270,18 @@ async fn fill(
 
 async fn ws_upgrade(
     State(feeds): State<Arc<Feeds>>,
-    Path(coin): Path<String>,
+    Path((venue, coin)): Path<(Venue, String)>,
     upgrade: WebSocketUpgrade,
 ) -> Response {
-    match feeds.subscribe(&coin) {
+    let market = MarketId::new(venue, coin);
+    match feeds.subscribe(&market) {
         None => (StatusCode::NOT_FOUND, "unknown market").into_response(),
-        Some(rx) => upgrade.on_upgrade(move |socket| stream_book(socket, coin, rx)),
+        Some(rx) => upgrade.on_upgrade(move |socket| stream_book(socket, market, rx)),
     }
 }
 
 /// Pushes the current book, then each change, until the client goes away.
-async fn stream_book(mut socket: WebSocket, coin: String, mut rx: BookRx) {
+async fn stream_book(mut socket: WebSocket, market: MarketId, mut rx: BookRx) {
     // Mark the current value as unseen so the first loop pass sends it.
     rx.mark_changed();
     loop {
@@ -283,7 +296,7 @@ async fn stream_book(mut socket: WebSocket, coin: String, mut rx: BookRx) {
                 // one across an await would block the connector's next write.
                 let payload = {
                     let slot = rx.borrow_and_update();
-                    serde_json::to_string(&BookMessage::new(&coin, &slot))
+                    serde_json::to_string(&BookMessage::new(&market, &slot))
                 };
                 let Ok(payload) = payload else { break };
                 if socket.send(Message::Text(payload.into())).await.is_err() {
@@ -298,5 +311,5 @@ async fn stream_book(mut socket: WebSocket, coin: String, mut rx: BookRx) {
             }
         }
     }
-    debug!(coin, "ws client disconnected");
+    debug!(%market, "ws client disconnected");
 }

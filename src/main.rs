@@ -39,7 +39,12 @@ async fn main() -> Result<()> {
     let config = Config::from_env()?;
     info!(?config, "starting");
 
-    let (feeds, publishers) = Feeds::channels(&config.coins);
+    let markets: Vec<MarketId> = config
+        .coins
+        .iter()
+        .map(|coin| MarketId::new(Venue::Hyperliquid, coin.as_str()))
+        .collect();
+    let (feeds, mut publishers) = Feeds::channels(&markets);
     let shutdown = CancellationToken::new();
 
     let mut schedule = Schedule::new();
@@ -54,14 +59,14 @@ async fn main() -> Result<()> {
     let engine = Engine::new(schedule, Thresholds::new(config.margin_call_multiple)?);
     let marks = feeds
         .mark_receivers()
-        .map(|(coin, rx)| (MarketId::new(Venue::Hyperliquid, coin), rx))
+        .map(|(market, rx)| (market.clone(), rx))
         .collect();
     let (command_tx, command_rx) = mpsc::channel(COMMAND_QUEUE);
     let (event_tx, event_rx) = mpsc::channel(EVENT_QUEUE);
 
     let connector = tokio::spawn(venue::hyperliquid::run(
         config.hl_ws_url.clone(),
-        publishers,
+        publishers.take(Venue::Hyperliquid),
         shutdown.clone(),
     ));
     let risk = tokio::spawn(task::run(

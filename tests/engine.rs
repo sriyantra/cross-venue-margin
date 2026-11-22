@@ -21,7 +21,7 @@ fn btc() -> MarketId {
 
 fn publish(tx: &MarkTx, mark: Decimal) {
     tx.send_replace(Some(MarkView {
-        venue: "hyperliquid",
+        venue: Venue::Hyperliquid,
         coin: "BTC".into(),
         mark,
     }));
@@ -40,7 +40,7 @@ fn start() -> Harness {
 }
 
 fn start_with_event_queue(capacity: usize) -> Harness {
-    let (feeds, mut publishers) = Feeds::channels(&["BTC".to_string()]);
+    let (feeds, mut publishers) = Feeds::channels(&[btc()]);
     let mut schedule = Schedule::new();
     schedule.insert(btc(), TierTable::flat(dec!(0.0125)).unwrap());
     let engine = Engine::new(schedule, Thresholds::new(dec!(1.5)).unwrap());
@@ -48,7 +48,7 @@ fn start_with_event_queue(capacity: usize) -> Harness {
     let (command_tx, command_rx) = mpsc::channel::<Command>(8);
     let (event_tx, events) = mpsc::channel(capacity);
     let shutdown = CancellationToken::new();
-    let marks = vec![(btc(), feeds.subscribe_mark("BTC").unwrap())];
+    let marks = vec![(btc(), feeds.subscribe_mark(&btc()).unwrap())];
     let task = tokio::spawn(task::run(
         engine,
         marks,
@@ -59,7 +59,11 @@ fn start_with_event_queue(capacity: usize) -> Harness {
 
     Harness {
         engine: EngineHandle::new(command_tx),
-        mark: publishers.remove("BTC").unwrap().mark,
+        mark: publishers
+            .take(Venue::Hyperliquid)
+            .remove("BTC")
+            .unwrap()
+            .mark,
         events,
         shutdown,
         task,

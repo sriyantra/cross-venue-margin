@@ -4,6 +4,7 @@
 use std::time::Duration;
 
 use cross_venue_margin::feed::{BookRx, Feeds, MarkRx};
+use cross_venue_margin::risk::{MarketId, Venue};
 use cross_venue_margin::venue::hyperliquid;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
@@ -12,11 +13,11 @@ use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_util::sync::CancellationToken;
 
-type Venue = WebSocketStream<TcpStream>;
+type FakeVenue = WebSocketStream<TcpStream>;
 
 const WAIT: Duration = Duration::from_secs(5);
 
-async fn accept(listener: &TcpListener) -> Venue {
+async fn accept(listener: &TcpListener) -> FakeVenue {
     let (stream, _) = tokio::time::timeout(WAIT, listener.accept())
         .await
         .unwrap()
@@ -25,7 +26,7 @@ async fn accept(listener: &TcpListener) -> Venue {
 }
 
 /// Reads client frames until one has the given `method`, skipping pings.
-async fn expect_method(venue: &mut Venue, method: &str) -> Value {
+async fn expect_method(venue: &mut FakeVenue, method: &str) -> Value {
     loop {
         let frame = tokio::time::timeout(WAIT, venue.next())
             .await
@@ -77,7 +78,7 @@ fn mark(px: &str) -> Message {
 }
 
 /// Reads the two subscriptions the connector sends for a market on connect.
-async fn expect_subscriptions(venue: &mut Venue) {
+async fn expect_subscriptions(venue: &mut FakeVenue) {
     let book = expect_method(venue, "subscribe").await;
     assert_eq!(book["subscription"], json!({ "type": "l2", "c": "BTC" }));
     let ctx = expect_method(venue, "subscribe").await;
@@ -101,13 +102,18 @@ async fn wait_for_mark(rx: &mut MarkRx, want: Option<&str>) {
 async fn start_with_marks() -> (TcpListener, BookRx, MarkRx, CancellationToken) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("ws://{}", listener.local_addr().unwrap());
-    let (feeds, publishers) = Feeds::channels(&["BTC".to_string()]);
+    let btc = MarketId::new(Venue::Hyperliquid, "BTC");
+    let (feeds, mut publishers) = Feeds::channels(std::slice::from_ref(&btc));
     let shutdown = CancellationToken::new();
-    tokio::spawn(hyperliquid::run(url, publishers, shutdown.clone()));
+    tokio::spawn(hyperliquid::run(
+        url,
+        publishers.take(Venue::Hyperliquid),
+        shutdown.clone(),
+    ));
     (
         listener,
-        feeds.subscribe("BTC").unwrap(),
-        feeds.subscribe_mark("BTC").unwrap(),
+        feeds.subscribe(&btc).unwrap(),
+        feeds.subscribe_mark(&btc).unwrap(),
         shutdown,
     )
 }
