@@ -9,12 +9,14 @@ use rust_decimal::Decimal;
 use thiserror::Error;
 
 pub mod health;
+pub mod lifecycle;
 pub mod liquidation;
 mod num;
 pub mod schedule;
 pub mod types;
 
 pub use health::{Health, account_health};
+pub use lifecycle::{AccountState, ThresholdError, Thresholds, Transition, step};
 pub use liquidation::{LiquidationPrice, liquidation_price};
 pub use schedule::{Schedule, ScheduleError, Tier, TierTable};
 pub use types::{Account, MarketId, Marks, Position, PositionError, Side, Venue};

@@ -2,8 +2,8 @@
 //! for every account, and proptest searches for an account that breaks it.
 
 use cross_venue_margin::risk::{
-    Account, LiquidationPrice, MarketId, Marks, Position, Schedule, Side, TierTable, Venue,
-    account_health, liquidation_price,
+    Account, AccountState, Health, LiquidationPrice, MarketId, Marks, Position, Schedule, Side,
+    Thresholds, TierTable, Venue, account_health, liquidation_price, step,
 };
 use proptest::prelude::*;
 use rust_decimal::{Decimal, dec};
@@ -161,6 +161,57 @@ proptest! {
             prop_assert!(m_low <= m_high);
             // No rate here is above 5%, so no step can exceed 5% of the gap.
             prop_assert!(m_high - m_low <= (high - low) * dec!(0.05) + TOLERANCE);
+        }
+    }
+
+    /// Replaying any sequence of health readings: the state always matches
+    /// the latest reading, `Closed` is final, a transition is reported
+    /// exactly when the state changes, and a timestamp never moves while
+    /// the state holds.
+    #[test]
+    fn lifecycle_follows_health(
+        readings in proptest::collection::vec((-1_000i64..=5_000, 0i64..=2_000, any::<bool>()), 1..40),
+    ) {
+        let thresholds = Thresholds::new(dec!(1.5)).unwrap();
+        let mut state = AccountState::Open;
+
+        for (now, (equity, maintenance, has_positions)) in readings.into_iter().enumerate() {
+            let (equity, maintenance) = (Decimal::from(equity), Decimal::from(maintenance));
+            let health = Health {
+                equity,
+                unrealized_pnl: dec!(0),
+                notional: dec!(0),
+                maintenance_required: maintenance,
+                margin_available: equity - maintenance,
+            };
+            let (next, transition) = step(state, &health, has_positions, &thresholds, now as u64).unwrap();
+
+            prop_assert_eq!(transition.is_some(), next != state);
+            if let Some(t) = transition {
+                prop_assert_eq!((t.from, t.to, t.at), (state, next, now as u64));
+            }
+            match (state, next) {
+                (AccountState::Closed { .. }, _) => prop_assert_eq!(next, state),
+                (AccountState::Liquidating { .. }, AccountState::Closed { .. }) => {
+                    prop_assert!(!has_positions)
+                }
+                (_, AccountState::Closed { .. }) => prop_assert!(false, "closed without liquidating"),
+                (_, AccountState::Liquidating { .. }) => {
+                    prop_assert!(has_positions && equity < maintenance)
+                }
+                (_, AccountState::MarginCall { .. }) => prop_assert!(
+                    has_positions && equity >= maintenance && equity < maintenance * dec!(1.5)
+                ),
+                (_, AccountState::Open) => {
+                    prop_assert!(!has_positions || equity >= maintenance * dec!(1.5))
+                }
+            }
+            let (again, repeat) = step(next, &health, has_positions, &thresholds, now as u64 + 1).unwrap();
+            if !matches!((next, again), (AccountState::Liquidating { .. }, AccountState::Closed { .. })) {
+                prop_assert_eq!(again, next);
+                prop_assert_eq!(repeat, None);
+            }
+            state = next;
         }
     }
 }
