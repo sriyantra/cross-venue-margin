@@ -7,6 +7,7 @@
 //! - `POST /accounts`             open a paper account
 //! - `GET /accounts/{id}`         health, state and positions
 //! - `POST /accounts/{id}/fills`  fill a paper order at the mark
+//! - `GET /metrics`              process metrics for a Prometheus scraper
 //!
 //! Market data handlers only read from watch channels. They never touch a
 //! `Book`. Account handlers send a command to the engine task and wait for
@@ -18,7 +19,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{FromRef, Path, State};
-use axum::http::StatusCode;
+use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -30,6 +31,7 @@ use tracing::{debug, info};
 use crate::engine::task::EngineHandle;
 use crate::engine::{AccountId, EngineError};
 use crate::feed::{BookRx, BookView, Feeds, MarkView, Slot};
+use crate::metrics::{self, Metrics};
 use crate::risk::{MarketId, Side, Venue};
 
 /// What every handler can reach. Each handler asks for only the part it
@@ -38,6 +40,7 @@ use crate::risk::{MarketId, Side, Venue};
 struct AppState {
     feeds: Arc<Feeds>,
     engine: EngineHandle,
+    metrics: Metrics,
 }
 
 impl FromRef<AppState> for Arc<Feeds> {
@@ -49,6 +52,12 @@ impl FromRef<AppState> for Arc<Feeds> {
 impl FromRef<AppState> for EngineHandle {
     fn from_ref(state: &AppState) -> Self {
         state.engine.clone()
+    }
+}
+
+impl FromRef<AppState> for Metrics {
+    fn from_ref(state: &AppState) -> Self {
+        state.metrics.clone()
     }
 }
 
@@ -124,7 +133,7 @@ struct Health {
     markets: Vec<MarketHealth>,
 }
 
-pub fn router(feeds: Feeds, engine: EngineHandle) -> Router {
+pub fn router(feeds: Feeds, engine: EngineHandle, metrics: Metrics) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/book/{venue}/{coin}", get(book))
@@ -133,9 +142,11 @@ pub fn router(feeds: Feeds, engine: EngineHandle) -> Router {
         .route("/accounts", post(create_account))
         .route("/accounts/{id}", get(account))
         .route("/accounts/{id}/fills", post(fill))
+        .route("/metrics", get(render_metrics))
         .with_state(AppState {
             feeds: Arc::new(feeds),
             engine,
+            metrics,
         })
 }
 
@@ -144,11 +155,12 @@ pub async fn serve(
     bind: SocketAddr,
     feeds: Feeds,
     engine: EngineHandle,
+    metrics: Metrics,
     shutdown: CancellationToken,
 ) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(bind).await?;
     info!(addr = %listener.local_addr()?, "api listening");
-    axum::serve(listener, router(feeds, engine))
+    axum::serve(listener, router(feeds, engine, metrics))
         .with_graceful_shutdown(async move { shutdown.cancelled().await })
         .await?;
     Ok(())
@@ -217,6 +229,14 @@ async fn mark(
         )
             .into_response(),
     }
+}
+
+async fn render_metrics(State(metrics): State<Metrics>) -> Response {
+    (
+        [(header::CONTENT_TYPE, metrics::CONTENT_TYPE)],
+        metrics.render(),
+    )
+        .into_response()
 }
 
 fn engine_error(error: EngineError) -> Response {

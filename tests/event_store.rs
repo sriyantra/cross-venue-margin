@@ -8,6 +8,7 @@
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use cross_venue_margin::engine::{AccountId, Engine, Event};
+use cross_venue_margin::metrics::Metrics;
 use cross_venue_margin::risk::{MarketId, Schedule, Side, Thresholds, TierTable, Venue};
 use cross_venue_margin::store::{self, EventStore};
 use rust_decimal::dec;
@@ -141,7 +142,7 @@ async fn writer_task_stores_everything_it_receives_in_order() {
     let (_, events) = history();
     let (tx, rx) = mpsc::channel(2);
     let shutdown = CancellationToken::new();
-    let writer = tokio::spawn(store::run(store.clone(), rx, shutdown));
+    let writer = tokio::spawn(store::run(store.clone(), rx, Metrics::new(), shutdown));
 
     for _ in 0..50 {
         for event in &events {

@@ -4,7 +4,7 @@
 //! One task writes to it, in the order the engine emitted the events, so
 //! reading it back in `seq` order gives `Engine::restore` the same history.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use sqlx::postgres::{PgPool, PgPoolOptions};
 use sqlx::types::Json;
@@ -14,6 +14,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 use crate::engine::Event;
+use crate::metrics::Metrics;
 
 /// Most events written in one transaction.
 const BATCH: usize = 256;
@@ -83,14 +84,17 @@ fn db_int(value: u64) -> Result<i64, StoreError> {
 pub async fn run(
     store: EventStore,
     mut events: mpsc::Receiver<Event>,
+    metrics: Metrics,
     shutdown: CancellationToken,
 ) {
     let mut batch = Vec::with_capacity(BATCH);
     while events.recv_many(&mut batch, BATCH).await > 0 {
         let mut delay = RETRY_START;
         loop {
+            let started = Instant::now();
             match store.append(&batch).await {
                 Ok(()) => {
+                    metrics.log_written(started.elapsed());
                     debug!(count = batch.len(), "events written");
                     break;
                 }
@@ -102,6 +106,7 @@ pub async fn run(
                     break;
                 }
                 Err(error) => {
+                    metrics.log_write_failed();
                     warn!(%error, count = batch.len(), retry_in = ?delay, "event write failed");
                     tokio::select! {
                         _ = shutdown.cancelled() => {}

@@ -14,6 +14,7 @@ use std::sync::Arc;
 use rust_decimal::Decimal;
 use serde::Serialize;
 use tokio::sync::watch;
+use tokio::time::Instant;
 
 use crate::book::{Book, Level};
 use crate::risk::{MarketId, Venue};
@@ -54,11 +55,14 @@ pub type BookRx = watch::Receiver<Slot>;
 
 /// The venue's own mark price for one market. This is the price the venue
 /// uses for margin and liquidation, which is not the book's mid.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct MarkView {
     pub venue: Venue,
     pub coin: String,
     pub mark: Decimal,
+    /// When the frame that carried this price was read off the socket.
+    #[serde(skip)]
+    pub received: Instant,
 }
 
 /// `None` means there is no trustworthy mark: not yet received,

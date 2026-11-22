@@ -4,6 +4,7 @@
 use std::time::Duration;
 
 use cross_venue_margin::feed::{BookRx, Feeds, MarkRx};
+use cross_venue_margin::metrics::Metrics;
 use cross_venue_margin::risk::{MarketId, Venue};
 use cross_venue_margin::venue::okx;
 use futures_util::{SinkExt, StreamExt};
@@ -105,7 +106,12 @@ async fn start() -> (TcpListener, BookRx, MarkRx, CancellationToken) {
     let btc = MarketId::new(Venue::Okx, "BTC");
     let (feeds, mut publishers) = Feeds::channels(std::slice::from_ref(&btc));
     let shutdown = CancellationToken::new();
-    tokio::spawn(okx::run(url, publishers.take(Venue::Okx), shutdown.clone()));
+    tokio::spawn(okx::run(
+        url,
+        publishers.take(Venue::Okx),
+        Metrics::new(),
+        shutdown.clone(),
+    ));
     (
         listener,
         feeds.subscribe(&btc).unwrap(),

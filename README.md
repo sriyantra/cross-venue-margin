@@ -44,6 +44,8 @@ Accounts are paper accounts. The service places no orders and holds no funds.
   slow or failing database slows the engine down. It does not drop events.
 - On start the service reads the log in order and rebuilds every account
   from it. A log that does not describe a possible history is rejected.
+- Metrics for a Prometheus scraper, including a histogram of the time from
+  a mark price arriving to the engine having acted on it.
 
 ## Margin model
 
@@ -109,6 +111,7 @@ Environment:
 | `POST /accounts`            | Open a paper account. Body: `{"collateral":"5000"}` |
 | `GET /accounts/{id}`        | State, health, and positions with liquidation prices |
 | `POST /accounts/{id}/fills` | Fill at the mark. Body: `{"venue":"hyperliquid","coin":"BTC","side":"long","size":"0.5"}` |
+| `GET /metrics`              | Metrics in the OpenMetrics text format |
 
 Amounts are JSON strings, so no value passes through a binary float.
 
@@ -153,6 +156,25 @@ Postgres     --events in order, at startup--> engine (rebuilt before it runs)
   Postgres. A crash in that window loses the event.
 - Prices and sizes are `rust_decimal::Decimal`, parsed from the venue's
   strings. No binary floats.
+
+## Metrics
+
+| Metric | Meaning |
+| ------ | ------- |
+| `feed_to_decision_seconds{venue}` | Histogram. Starts when a mark price frame is read off the socket. Stops when the engine has rechecked every account against that price |
+| `engine_events_total{kind}` | Account events the engine emitted |
+| `feed_reconnects_total{venue}` | Venue sessions that ended and were reconnected |
+| `book_resyncs_total{venue}` | Books cleared and resubscribed after a desync |
+| `event_log_write_seconds` | Histogram. Time to commit one batch of events |
+| `event_log_write_failures_total` | Event log writes that failed and were retried |
+
+- `feed_to_decision_seconds` covers this process only: decoding the frame,
+  the hand-off to the engine task, and the margin check. It does not
+  include the network path from the venue or the time to write the
+  resulting events.
+- A mark that is replaced before the engine wakes is never applied, so it
+  is not in the histogram. A frame that repeats the current price is not
+  in it either.
 
 ## Test
 

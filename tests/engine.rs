@@ -6,6 +6,7 @@ use std::time::Duration;
 use cross_venue_margin::engine::task::{self, Command, EngineHandle};
 use cross_venue_margin::engine::{AccountView, Engine, EngineError, Event};
 use cross_venue_margin::feed::{Feeds, MarkTx, MarkView};
+use cross_venue_margin::metrics::Metrics;
 use cross_venue_margin::risk::{
     AccountState, MarketId, Schedule, Side, Thresholds, TierTable, Venue,
 };
@@ -24,6 +25,7 @@ fn publish(tx: &MarkTx, mark: Decimal) {
         venue: Venue::Hyperliquid,
         coin: "BTC".into(),
         mark,
+        received: tokio::time::Instant::now(),
     }));
 }
 
@@ -31,6 +33,7 @@ struct Harness {
     engine: EngineHandle,
     mark: MarkTx,
     events: mpsc::Receiver<Event>,
+    metrics: Metrics,
     shutdown: CancellationToken,
     task: tokio::task::JoinHandle<()>,
 }
@@ -49,11 +52,13 @@ fn start_with_event_queue(capacity: usize) -> Harness {
     let (event_tx, events) = mpsc::channel(capacity);
     let shutdown = CancellationToken::new();
     let marks = vec![(btc(), feeds.subscribe_mark(&btc()).unwrap())];
+    let metrics = Metrics::new();
     let task = tokio::spawn(task::run(
         engine,
         marks,
         command_rx,
         event_tx,
+        metrics.clone(),
         shutdown.clone(),
     ));
 
@@ -65,6 +70,7 @@ fn start_with_event_queue(capacity: usize) -> Harness {
             .unwrap()
             .mark,
         events,
+        metrics,
         shutdown,
         task,
     }
@@ -155,6 +161,21 @@ async fn mark_move_liquidates_and_every_event_is_delivered_in_order() {
             ..
         }
     ));
+
+    // Two marks reached the engine and five events left it.
+    let text = h.metrics.render();
+    assert!(
+        text.contains("feed_to_decision_seconds_count{venue=\"hyperliquid\"} 2"),
+        "{text}"
+    );
+    assert!(
+        text.contains("engine_events_total{kind=\"state_changed\"} 2"),
+        "{text}"
+    );
+    assert!(
+        text.contains("engine_events_total{kind=\"liquidated\"} 1"),
+        "{text}"
+    );
 
     h.shutdown.cancel();
 }

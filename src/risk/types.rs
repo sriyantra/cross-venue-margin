@@ -18,12 +18,18 @@ pub enum Venue {
     Okx,
 }
 
+impl Venue {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Venue::Hyperliquid => "hyperliquid",
+            Venue::Okx => "okx",
+        }
+    }
+}
+
 impl fmt::Display for Venue {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Venue::Hyperliquid => f.write_str("hyperliquid"),
-            Venue::Okx => f.write_str("okx"),
-        }
+        f.write_str(self.as_str())
     }
 }
 

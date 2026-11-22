@@ -3,6 +3,7 @@ use cross_venue_margin::config::Config;
 use cross_venue_margin::engine::task::{self, EngineHandle};
 use cross_venue_margin::engine::{Engine, Event};
 use cross_venue_margin::feed::Feeds;
+use cross_venue_margin::metrics::Metrics;
 use cross_venue_margin::risk::{MarginTable, MarketId, Schedule, Thresholds, Venue};
 use cross_venue_margin::store::{self, EventStore};
 use cross_venue_margin::{server, venue};
@@ -52,6 +53,7 @@ async fn main() -> Result<()> {
     }
     let (feeds, mut publishers) = Feeds::channels(&markets);
     let shutdown = CancellationToken::new();
+    let metrics = Metrics::new();
 
     let mut schedule = Schedule::new();
     for market in &markets {
@@ -95,11 +97,13 @@ async fn main() -> Result<()> {
     let hyperliquid = tokio::spawn(venue::hyperliquid::run(
         config.hl_ws_url.clone(),
         publishers.take(Venue::Hyperliquid),
+        metrics.clone(),
         shutdown.clone(),
     ));
     let okx = tokio::spawn(venue::okx::run(
         config.okx_ws_url.clone(),
         publishers.take(Venue::Okx),
+        metrics.clone(),
         shutdown.clone(),
     ));
     let risk = tokio::spawn(task::run(
@@ -107,16 +111,23 @@ async fn main() -> Result<()> {
         marks,
         command_rx,
         event_tx,
+        metrics.clone(),
         shutdown.clone(),
     ));
     let event_log = match store {
-        Some(store) => tokio::spawn(store::run(store, event_rx, shutdown.clone())),
+        Some(store) => tokio::spawn(store::run(
+            store,
+            event_rx,
+            metrics.clone(),
+            shutdown.clone(),
+        )),
         None => tokio::spawn(log_events(event_rx)),
     };
     let api = tokio::spawn(server::serve(
         config.bind,
         feeds,
         EngineHandle::new(command_tx),
+        metrics,
         shutdown.clone(),
     ));
 

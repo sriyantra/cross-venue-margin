@@ -29,6 +29,7 @@ use tracing::{debug, info, warn};
 use super::market::{MARK_CHECK_EVERY, Market};
 use crate::book::{Desync, Level, SideDiff};
 use crate::feed::Publisher;
+use crate::metrics::Metrics;
 use crate::risk::{TierTable, Venue};
 
 const VENUE: Venue = Venue::Hyperliquid;
@@ -258,7 +259,12 @@ enum SessionEnd {
 /// Reconnects forever with exponential backoff. Every reconnect starts from
 /// empty books and no marks, and readers see `None` for each market until
 /// fresh data arrives.
-pub async fn run(url: String, publishers: HashMap<String, Publisher>, shutdown: CancellationToken) {
+pub async fn run(
+    url: String,
+    publishers: HashMap<String, Publisher>,
+    metrics: Metrics,
+    shutdown: CancellationToken,
+) {
     let mut markets: HashMap<String, Market> = publishers
         .into_iter()
         .map(|(coin, publisher)| (coin.clone(), Market::new(VENUE, coin, publisher)))
@@ -267,7 +273,7 @@ pub async fn run(url: String, publishers: HashMap<String, Publisher>, shutdown: 
     let mut backoff = BACKOFF_START;
     loop {
         let mut got_snapshot = false;
-        let outcome = session(&url, &mut markets, &shutdown, &mut got_snapshot).await;
+        let outcome = session(&url, &mut markets, &metrics, &shutdown, &mut got_snapshot).await;
 
         for market in markets.values_mut() {
             market.invalidate();
@@ -287,6 +293,7 @@ pub async fn run(url: String, publishers: HashMap<String, Publisher>, shutdown: 
         if got_snapshot {
             backoff = BACKOFF_START;
         }
+        metrics.reconnect(VENUE);
         info!(venue = %VENUE, delay = ?backoff, "reconnecting");
         tokio::select! {
             _ = shutdown.cancelled() => return,
@@ -312,6 +319,7 @@ fn mark_subscription(coin: &str) -> Message {
 async fn session(
     url: &str,
     markets: &mut HashMap<String, Market>,
+    metrics: &Metrics,
     shutdown: &CancellationToken,
     got_snapshot: &mut bool,
 ) -> Result<SessionEnd, SessionError> {
@@ -361,7 +369,10 @@ async fn session(
                 last_frame = Instant::now();
                 match message {
                     Message::Text(text) => {
-                        for coin in handle_text(text.as_str(), markets, got_snapshot) {
+                        let resubscribe =
+                            handle_text(text.as_str(), last_frame, markets, got_snapshot);
+                        for coin in resubscribe {
+                            metrics.resync(VENUE);
                             ws.send(subscription("unsubscribe", &coin)).await?;
                             ws.send(subscription("subscribe", &coin)).await?;
                         }
@@ -378,6 +389,7 @@ async fn session(
 /// Applies one text frame. Returns the markets that need a resubscribe.
 fn handle_text(
     text: &str,
+    received: Instant,
     markets: &mut HashMap<String, Market>,
     got_snapshot: &mut bool,
 ) -> Vec<String> {
@@ -445,7 +457,7 @@ fn handle_text(
         }
         Event::Mark { coin, mark } => {
             if let Some(market) = markets.get_mut(&coin) {
-                market.set_mark(mark, Instant::now());
+                market.set_mark(mark, received);
             }
             Vec::new()
         }

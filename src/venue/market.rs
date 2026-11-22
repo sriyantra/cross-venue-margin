@@ -67,8 +67,9 @@ impl Market {
         true
     }
 
-    /// Publishes a mark. Venues repeat an unchanged mark, so readers are
-    /// only woken when the price is different.
+    /// Publishes a mark from a frame read at `now`. Venues repeat an
+    /// unchanged mark, so readers are only woken when the price is
+    /// different.
     pub(crate) fn set_mark(&mut self, mark: Decimal, now: Instant) {
         if mark <= Decimal::ZERO {
             warn!(venue = %self.venue, coin = self.book.coin(), %mark, "mark is not a price");
@@ -80,9 +81,10 @@ impl Market {
             venue: self.venue,
             coin: self.book.coin().to_string(),
             mark,
+            received: now,
         };
         self.publisher.mark.send_if_modified(|slot| {
-            if slot.as_ref() == Some(&view) {
+            if slot.as_ref().is_some_and(|current| current.mark == mark) {
                 return false;
             }
             *slot = Some(view);

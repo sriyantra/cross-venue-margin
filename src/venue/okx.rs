@@ -31,6 +31,7 @@ use tracing::{debug, info, warn};
 use super::market::{MARK_CHECK_EVERY, Market};
 use crate::book::{Desync, Level, SideDiff};
 use crate::feed::Publisher;
+use crate::metrics::Metrics;
 use crate::risk::{SizeTable, Venue};
 
 const VENUE: Venue = Venue::Okx;
@@ -312,7 +313,12 @@ impl Tracked {
 /// `publishers` is keyed by coin. A coin with no known instrument is
 /// dropped with a warning. Reconnects forever with exponential backoff, and
 /// every reconnect starts from empty books and no marks.
-pub async fn run(url: String, publishers: HashMap<String, Publisher>, shutdown: CancellationToken) {
+pub async fn run(
+    url: String,
+    publishers: HashMap<String, Publisher>,
+    metrics: Metrics,
+    shutdown: CancellationToken,
+) {
     let mut tracked: HashMap<String, Tracked> = HashMap::new();
     for (coin, publisher) in publishers {
         let Some(instrument) = instrument(&coin) else {
@@ -330,7 +336,7 @@ pub async fn run(url: String, publishers: HashMap<String, Publisher>, shutdown: 
     let mut backoff = BACKOFF_START;
     loop {
         let mut got_snapshot = false;
-        let outcome = session(&url, &mut tracked, &shutdown, &mut got_snapshot).await;
+        let outcome = session(&url, &mut tracked, &metrics, &shutdown, &mut got_snapshot).await;
 
         for state in tracked.values_mut() {
             state.last_seq = None;
@@ -349,6 +355,7 @@ pub async fn run(url: String, publishers: HashMap<String, Publisher>, shutdown: 
         if got_snapshot {
             backoff = BACKOFF_START;
         }
+        metrics.reconnect(VENUE);
         info!(venue = %VENUE, delay = ?backoff, "reconnecting");
         tokio::select! {
             _ = shutdown.cancelled() => return,
@@ -373,6 +380,7 @@ fn request(op: &str, channels: &[&str], inst_ids: &[&str]) -> Message {
 async fn session(
     url: &str,
     tracked: &mut HashMap<String, Tracked>,
+    metrics: &Metrics,
     shutdown: &CancellationToken,
     got_snapshot: &mut bool,
 ) -> Result<SessionEnd, SessionError> {
@@ -419,7 +427,10 @@ async fn session(
                 last_frame = Instant::now();
                 match message {
                     Message::Text(text) => {
-                        for inst_id in handle_text(text.as_str(), tracked, got_snapshot) {
+                        let resubscribe =
+                            handle_text(text.as_str(), last_frame, tracked, got_snapshot);
+                        for inst_id in resubscribe {
+                            metrics.resync(VENUE);
                             ws.send(request("unsubscribe", &["books"], &[&inst_id])).await?;
                             ws.send(request("subscribe", &["books"], &[&inst_id])).await?;
                         }
@@ -436,6 +447,7 @@ async fn session(
 /// resubscribe.
 fn handle_text(
     text: &str,
+    received: Instant,
     tracked: &mut HashMap<String, Tracked>,
     got_snapshot: &mut bool,
 ) -> Vec<String> {
@@ -530,7 +542,7 @@ fn handle_text(
         }
         Event::Mark { inst_id, mark } => {
             if let Some(state) = tracked.get_mut(&inst_id) {
-                state.market.set_mark(mark, Instant::now());
+                state.market.set_mark(mark, received);
             }
             Vec::new()
         }

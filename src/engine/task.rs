@@ -14,6 +14,7 @@ use tracing::info;
 
 use super::{AccountId, AccountView, Engine, EngineError, Event};
 use crate::feed::MarkRx;
+use crate::metrics::Metrics;
 use crate::risk::{MarketId, Side};
 
 type Reply<T> = oneshot::Sender<T>;
@@ -117,6 +118,7 @@ pub async fn run(
     marks: Vec<(MarketId, MarkRx)>,
     mut commands: mpsc::Receiver<Command>,
     events: mpsc::Sender<Event>,
+    metrics: Metrics,
     shutdown: CancellationToken,
 ) {
     let mut marks: Vec<Watched> = marks
@@ -159,11 +161,15 @@ pub async fn run(
                     .rx
                     .borrow_and_update()
                     .as_ref()
-                    .map(|view| view.mark)
+                    .map(|view| (view.mark, view.received))
             };
-            if current != watched.applied {
-                out.extend(engine.set_mark(watched.market.clone(), current, now));
-                watched.applied = current;
+            let mark = current.map(|(mark, _)| mark);
+            if mark != watched.applied {
+                out.extend(engine.set_mark(watched.market.clone(), mark, now));
+                watched.applied = mark;
+                if let Some((_, received)) = current {
+                    metrics.mark_applied(watched.market.venue, received.elapsed());
+                }
             }
             !closed
         });
@@ -175,6 +181,7 @@ pub async fn run(
         // A full queue makes the engine wait here, which is the point: an
         // event is never dropped. Shutdown must still get through.
         for event in out {
+            metrics.event(event.kind());
             tokio::select! {
                 _ = shutdown.cancelled() => break 'run,
                 sent = events.send(event) => if sent.is_err() {

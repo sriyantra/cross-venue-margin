@@ -4,6 +4,7 @@
 use std::time::Duration;
 
 use cross_venue_margin::feed::{BookRx, Feeds, MarkRx};
+use cross_venue_margin::metrics::Metrics;
 use cross_venue_margin::risk::{MarketId, Venue};
 use cross_venue_margin::venue::hyperliquid;
 use futures_util::{SinkExt, StreamExt};
@@ -108,6 +109,7 @@ async fn start_with_marks() -> (TcpListener, BookRx, MarkRx, CancellationToken) 
     tokio::spawn(hyperliquid::run(
         url,
         publishers.take(Venue::Hyperliquid),
+        Metrics::new(),
         shutdown.clone(),
     ));
     (
