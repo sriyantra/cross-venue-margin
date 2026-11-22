@@ -4,11 +4,12 @@ A Rust service that keeps live order books from more than one trading venue and
 computes margin for accounts whose positions span those venues on a single
 collateral balance.
 
-Status: stage 3 of 4, in progress. Two venues are connected, Hyperliquid and
+Status: stage 3 of 4 is done. Two venues are connected, Hyperliquid and
 OKX, with live books and mark prices from both. A paper account can hold
 positions on both venues against one collateral balance, each margined by
-its own venue's rules and marked at its own venue's price. The event log
-and replay are not built yet.
+its own venue's rules and marked at its own venue's price. Every account
+event goes to an append-only log in Postgres, and the service rebuilds its
+accounts from that log when it starts.
 
 Accounts are paper accounts. The service places no orders and holds no funds.
 
@@ -38,8 +39,11 @@ Accounts are paper accounts. The service places no orders and holds no funds.
 - An account state machine: open, margin call, liquidating, closed. An
   account whose equity falls below maintenance margin is closed out at the
   mark.
-- Every account event (opened, filled, state changed, liquidated) is emitted
-  in order. For now the events go to the log.
+- Every account event (opened, filled, state changed, liquidated) is
+  written to an append-only Postgres table through a bounded channel. A
+  slow or failing database slows the engine down. It does not drop events.
+- On start the service reads the log in order and rebuilds every account
+  from it. A log that does not describe a possible history is rejected.
 
 ## Margin model
 
@@ -89,6 +93,7 @@ Environment:
 | `OKX_WS_URL` | `wss://ws.okx.com:443/ws/v5/public` | OKX public WebSocket URL |
 | `COINS`     | `BTC,ETH`                      | Coins to track on each venue that lists them |
 | `BIND`      | `127.0.0.1:8080`               | API listen address         |
+| `DATABASE_URL` | unset                       | Postgres URL for the event log. Without it events are only logged and accounts are lost on restart |
 | `MARGIN_CALL_MULTIPLE` | `1.5`               | Margin call starts when equity is below maintenance margin times this |
 | `RUST_LOG`  | `info`                         | Log filter                 |
 
@@ -121,7 +126,8 @@ curl -s -H 'content-type: application/json' \
 venue task (owns socket + books) --watch: book, mark--> API handlers
                                  --watch: mark-------> engine task (owns accounts)
 API handlers --bounded mpsc: commands, one-shot replies--> engine task
-engine task  --bounded mpsc: events--> event log (stdout for now)
+engine task  --bounded mpsc: events--> log writer task --> Postgres (append-only)
+Postgres     --events in order, at startup--> engine (rebuilt before it runs)
 ```
 
 - `book` is pure. It has no I/O and no clock, so it is tested by replaying
@@ -139,6 +145,12 @@ engine task  --bounded mpsc: events--> event log (stdout for now)
 - State where only the latest value matters (books, marks) goes through
   watch channels. Events that must not be lost go through a bounded queue,
   so a slow consumer slows the engine instead of dropping an event.
+- The event log holds what happened to accounts, not the marks that
+  caused it. Replaying it rebuilds collateral, positions and state exactly.
+  It does not re-run the decisions, because mark prices are not recorded.
+  The database rejects any update, delete or truncate on the table.
+- An API reply can reach the client before its event is committed to
+  Postgres. A crash in that window loses the event.
 - Prices and sizes are `rust_decimal::Decimal`, parsed from the venue's
   strings. No binary floats.
 
@@ -166,6 +178,15 @@ cargo test
   (addresses removed). Maintenance margin and every liquidation price must
   match. The sample holds only accounts with BTC and ETH cross positions and
   no collateral outside the perp balance.
+- `tests/restore_props.rs` runs random histories of accounts, fills and
+  mark moves on both venues, rebuilds a second engine from the events
+  alone, and requires it to report every account exactly as the first one
+  does. It also requires a log cut off at any event to restore.
+- `tests/event_store.rs` runs the store against a real Postgres: restore
+  after a restart, exact decimals, all-or-nothing appends, and rejected
+  updates and deletes. It needs `TEST_DATABASE_URL` and reports a skip
+  without it:
+  `TEST_DATABASE_URL=postgres://postgres@127.0.0.1:5432/postgres cargo test`
 - `tests/engine.rs` runs the engine task against hand-driven mark channels:
   liquidation on a mark move, a withdrawn mark, and a dead connector.
 
@@ -174,6 +195,6 @@ cargo test
 1. Hyperliquid connector, book, API. Done.
 2. Risk engine: paper accounts, account health, liquidation price, and an
    explicit account state machine. Done.
-3. Second venue (done), an append-only event log in Postgres, and
-   deterministic replay from that log.
+3. Second venue, an append-only event log in Postgres, and rebuilding
+   state from that log. Done.
 4. Docker image, metrics for feed-to-decision latency, deployment.

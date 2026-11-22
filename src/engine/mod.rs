@@ -79,6 +79,40 @@ pub enum Event {
     },
 }
 
+impl Event {
+    pub fn account(&self) -> AccountId {
+        match self {
+            Event::AccountOpened { account, .. }
+            | Event::Filled { account, .. }
+            | Event::StateChanged { account, .. }
+            | Event::Liquidated { account, .. }
+            | Event::Fault { account, .. } => *account,
+        }
+    }
+
+    /// Engine time of the event, in milliseconds.
+    pub fn at(&self) -> u64 {
+        match self {
+            Event::AccountOpened { at, .. }
+            | Event::Filled { at, .. }
+            | Event::StateChanged { at, .. }
+            | Event::Liquidated { at, .. }
+            | Event::Fault { at, .. } => *at,
+        }
+    }
+
+    /// The event's `type` tag as it appears in JSON.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Event::AccountOpened { .. } => "account_opened",
+            Event::Filled { .. } => "filled",
+            Event::StateChanged { .. } => "state_changed",
+            Event::Liquidated { .. } => "liquidated",
+            Event::Fault { .. } => "fault",
+        }
+    }
+}
+
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum EngineError {
     #[error("unknown account {0}")]

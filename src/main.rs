@@ -4,6 +4,7 @@ use cross_venue_margin::engine::task::{self, EngineHandle};
 use cross_venue_margin::engine::{Engine, Event};
 use cross_venue_margin::feed::Feeds;
 use cross_venue_margin::risk::{MarginTable, MarketId, Schedule, Thresholds, Venue};
+use cross_venue_margin::store::{self, EventStore};
 use cross_venue_margin::{server, venue};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -14,7 +15,8 @@ const COMMAND_QUEUE: usize = 64;
 /// Events waiting for the log. The engine waits when it is full.
 const EVENT_QUEUE: usize = 1024;
 
-/// Receives every engine event. For now it writes them to the log.
+/// Receives every engine event when there is no database, and writes each
+/// one to the process log.
 async fn log_events(mut events: mpsc::Receiver<Event>) {
     while let Some(event) = events.recv().await {
         match serde_json::to_string(&event) {
@@ -66,7 +68,23 @@ async fn main() -> Result<()> {
             None => warn!(%market, "no maintenance table, positions will be refused"),
         }
     }
-    let engine = Engine::new(schedule, Thresholds::new(config.margin_call_multiple)?);
+    let thresholds = Thresholds::new(config.margin_call_multiple)?;
+    let (engine, store) = match &config.database_url {
+        Some(url) => {
+            let store = EventStore::connect(url.expose()).await?;
+            let events = store.load().await?;
+            let engine = Engine::restore(schedule, thresholds, &events)?;
+            info!(
+                events = events.len(),
+                "accounts restored from the event log"
+            );
+            (engine, Some(store))
+        }
+        None => {
+            warn!("DATABASE_URL is not set, accounts will not survive a restart");
+            (Engine::new(schedule, thresholds), None)
+        }
+    };
     let marks = feeds
         .mark_receivers()
         .map(|(market, rx)| (market.clone(), rx))
@@ -91,7 +109,10 @@ async fn main() -> Result<()> {
         event_tx,
         shutdown.clone(),
     ));
-    let event_log = tokio::spawn(log_events(event_rx));
+    let event_log = match store {
+        Some(store) => tokio::spawn(store::run(store, event_rx, shutdown.clone())),
+        None => tokio::spawn(log_events(event_rx)),
+    };
     let api = tokio::spawn(server::serve(
         config.bind,
         feeds,

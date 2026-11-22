@@ -287,6 +287,12 @@ mod tests {
     #[test]
     fn events_survive_a_round_trip_through_json() {
         let (_, events) = liquidated_run();
+        for event in &events {
+            let json = serde_json::to_value(event).unwrap();
+            assert_eq!(json["type"], event.kind());
+            assert_eq!(json["account"], event.account().0);
+            assert_eq!(json["at"], event.at());
+        }
         let json = serde_json::to_string(&events).unwrap();
         let back: Vec<Event> = serde_json::from_str(&json).unwrap();
         assert_eq!(back, events);

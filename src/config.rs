@@ -5,6 +5,22 @@ use std::net::SocketAddr;
 use anyhow::{Context, Result, bail};
 use rust_decimal::Decimal;
 
+/// A value that must not reach the log. Its `Debug` output hides it.
+#[derive(Clone)]
+pub struct Secret(String);
+
+impl Secret {
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for Secret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("[set]")
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     /// Hyperliquid WebSocket endpoint.
@@ -18,6 +34,9 @@ pub struct Config {
     /// A margin call starts when equity falls below maintenance margin
     /// times this number.
     pub margin_call_multiple: Decimal,
+    /// Postgres URL for the event log. Without it events are only logged,
+    /// and accounts do not survive a restart.
+    pub database_url: Option<Secret>,
 }
 
 impl Config {
@@ -48,12 +67,18 @@ impl Config {
             .parse()
             .context("MARGIN_CALL_MULTIPLE must be a decimal such as 1.5")?;
 
+        let database_url = std::env::var("DATABASE_URL")
+            .ok()
+            .filter(|url| !url.is_empty())
+            .map(Secret);
+
         Ok(Self {
             hl_ws_url,
             okx_ws_url,
             coins,
             bind,
             margin_call_multiple,
+            database_url,
         })
     }
 }
