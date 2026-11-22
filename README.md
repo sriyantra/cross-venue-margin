@@ -4,9 +4,10 @@ A Rust service that keeps live order books from more than one trading venue and
 computes margin for accounts whose positions span those venues on a single
 collateral balance.
 
-Status: stage 2 of 4. One venue (Hyperliquid) is connected, and paper
-accounts are margined against its live mark prices. The second venue, which
-is what makes the margin cross-venue, is not built yet.
+Status: stage 3 of 4, in progress. Two venues are connected, Hyperliquid and
+OKX, with live books and mark prices from both. Paper accounts are margined
+on Hyperliquid positions only. OKX positions are refused until its margin
+tiers are added, so the margin is not cross-venue yet.
 
 Accounts are paper accounts. The service places no orders and holds no funds.
 
@@ -23,6 +24,11 @@ Accounts are paper accounts. The service places no orders and holds no funds.
   rebuilt, the API reports it as stale.
 - The venue's mark price per market (`activeAssetCtx`), withdrawn if the
   venue stops refreshing it.
+- OKX connector for USDT perpetuals on the `books` channel: one 400-level
+  snapshot, then updates keyed by price. Every update must name the
+  sequence number of the message before it, or the book is cleared and
+  resubscribed. Sizes are converted from contracts to coin.
+- OKX mark price per market (`mark-price`), with the same staleness rule.
 - HTTP and WebSocket API over the current books and marks.
 - Paper accounts with one collateral balance. Orders fill at the venue's
   mark. A fill that would leave the account in a margin call is refused.
@@ -65,7 +71,8 @@ Environment:
 | Variable    | Default                        | Meaning                    |
 | ----------- | ------------------------------ | -------------------------- |
 | `HL_WS_URL` | `wss://api.hyperliquid.xyz/ws` | Hyperliquid WebSocket URL  |
-| `COINS`     | `BTC,ETH`                      | Markets to track           |
+| `OKX_WS_URL` | `wss://ws.okx.com:443/ws/v5/public` | OKX public WebSocket URL |
+| `COINS`     | `BTC,ETH`                      | Coins to track on each venue that lists them |
 | `BIND`      | `127.0.0.1:8080`               | API listen address         |
 | `MARGIN_CALL_MULTIPLE` | `1.5`               | Margin call starts when equity is below maintenance margin times this |
 | `RUST_LOG`  | `info`                         | Log filter                 |
@@ -131,6 +138,10 @@ cargo test
   depth, and uncrossed invariants after every message.
 - `tests/connector.rs` runs the connector against a local fake venue to
   cover desync recovery, reconnect, and mark publication.
+- `tests/replay_okx.rs` replays 120 recorded OKX frames and checks the
+  sequence chain and the same book invariants.
+- `tests/connector_okx.rs` runs the OKX connector against a local fake
+  venue: sizes in coin, a sequence gap, and a reconnect.
 - `tests/risk_props.rs` holds property tests for the risk core: health is
   additive over positions, margin available is zero at the liquidation
   price, fills at the mark conserve equity, and the state machine always
@@ -148,6 +159,7 @@ cargo test
 1. Hyperliquid connector, book, API. Done.
 2. Risk engine: paper accounts, account health, liquidation price, and an
    explicit account state machine. Done.
-3. Second venue (CEX perps), an append-only event log in Postgres, and
-   deterministic replay from that log.
+3. Second venue (OKX books and marks are done, its margin tiers are not),
+   an append-only event log in Postgres, and deterministic replay from that
+   log.
 4. Docker image, metrics for feed-to-decision latency, deployment.

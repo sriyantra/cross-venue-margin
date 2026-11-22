@@ -39,21 +39,29 @@ async fn main() -> Result<()> {
     let config = Config::from_env()?;
     info!(?config, "starting");
 
-    let markets: Vec<MarketId> = config
-        .coins
-        .iter()
-        .map(|coin| MarketId::new(Venue::Hyperliquid, coin.as_str()))
-        .collect();
+    let mut markets = Vec::new();
+    for coin in &config.coins {
+        markets.push(MarketId::new(Venue::Hyperliquid, coin.as_str()));
+        if venue::okx::instrument(coin).is_some() {
+            markets.push(MarketId::new(Venue::Okx, coin.as_str()));
+        } else {
+            warn!(coin, "no OKX instrument, tracking it on Hyperliquid only");
+        }
+    }
     let (feeds, mut publishers) = Feeds::channels(&markets);
     let shutdown = CancellationToken::new();
 
     let mut schedule = Schedule::new();
-    for coin in &config.coins {
-        match venue::hyperliquid::maintenance_table(coin) {
+    for market in &markets {
+        let table = match market.venue {
+            Venue::Hyperliquid => venue::hyperliquid::maintenance_table(&market.coin),
+            Venue::Okx => None,
+        };
+        match table {
             Some(table) => {
-                schedule.insert(MarketId::new(Venue::Hyperliquid, coin.as_str()), table);
+                schedule.insert(market.clone(), table);
             }
-            None => warn!(coin, "no maintenance table, positions will be refused"),
+            None => warn!(%market, "no maintenance table, positions will be refused"),
         }
     }
     let engine = Engine::new(schedule, Thresholds::new(config.margin_call_multiple)?);
@@ -64,9 +72,14 @@ async fn main() -> Result<()> {
     let (command_tx, command_rx) = mpsc::channel(COMMAND_QUEUE);
     let (event_tx, event_rx) = mpsc::channel(EVENT_QUEUE);
 
-    let connector = tokio::spawn(venue::hyperliquid::run(
+    let hyperliquid = tokio::spawn(venue::hyperliquid::run(
         config.hl_ws_url.clone(),
         publishers.take(Venue::Hyperliquid),
+        shutdown.clone(),
+    ));
+    let okx = tokio::spawn(venue::okx::run(
+        config.okx_ws_url.clone(),
+        publishers.take(Venue::Okx),
         shutdown.clone(),
     ));
     let risk = tokio::spawn(task::run(
@@ -88,7 +101,8 @@ async fn main() -> Result<()> {
     info!("shutdown requested");
     shutdown.cancel();
 
-    connector.await?;
+    hyperliquid.await?;
+    okx.await?;
     risk.await?;
     event_log.await?;
     api.await??;

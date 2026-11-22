@@ -9,7 +9,9 @@ use rust_decimal::Decimal;
 pub struct Config {
     /// Hyperliquid WebSocket endpoint.
     pub hl_ws_url: String,
-    /// Markets to track, in Hyperliquid's coin naming (for example `BTC`).
+    /// OKX public WebSocket endpoint.
+    pub okx_ws_url: String,
+    /// Coins to track on every venue that lists them (for example `BTC`).
     pub coins: Vec<String>,
     /// Address the HTTP/WebSocket API listens on.
     pub bind: SocketAddr,
@@ -22,6 +24,9 @@ impl Config {
     pub fn from_env() -> Result<Self> {
         let hl_ws_url =
             std::env::var("HL_WS_URL").unwrap_or_else(|_| "wss://api.hyperliquid.xyz/ws".into());
+
+        let okx_ws_url = std::env::var("OKX_WS_URL")
+            .unwrap_or_else(|_| "wss://ws.okx.com:443/ws/v5/public".into());
 
         let coins: Vec<String> = std::env::var("COINS")
             .unwrap_or_else(|_| "BTC,ETH".into())
@@ -45,6 +50,7 @@ impl Config {
 
         Ok(Self {
             hl_ws_url,
+            okx_ws_url,
             coins,
             bind,
             margin_call_multiple,
