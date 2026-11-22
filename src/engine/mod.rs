@@ -89,6 +89,8 @@ pub enum EngineError {
     NoMark(MarketId),
     #[error("invalid fill: {0}")]
     InvalidFill(#[from] PositionError),
+    #[error("position size {size} is above the largest this market supports, {max}")]
+    PositionTooLarge { size: Decimal, max: Decimal },
     #[error("not enough margin for this fill")]
     InsufficientMargin,
     #[error("risk calculation failed: {0}")]
@@ -102,6 +104,7 @@ impl From<RiskError> for EngineError {
         match error {
             RiskError::MissingMark(market) => EngineError::NoMark(market),
             RiskError::MissingSchedule(market) => EngineError::UnsupportedMarket(market),
+            RiskError::AboveSchedule { size, max } => EngineError::PositionTooLarge { size, max },
             other => EngineError::Risk(other),
         }
     }
@@ -402,6 +405,73 @@ mod tests {
             .fill(id, market("BTC"), Side::Long, dec!(1), 2)
             .unwrap();
         (engine, id)
+    }
+
+    fn okx_btc() -> MarketId {
+        MarketId::new(Venue::Okx, "BTC")
+    }
+
+    /// The engine above plus OKX BTC with its real size brackets.
+    fn two_venue_engine() -> Engine {
+        let mut schedule = Schedule::new();
+        schedule.insert(market("BTC"), TierTable::flat(dec!(0.0125)).unwrap());
+        schedule.insert(
+            okx_btc(),
+            crate::venue::okx::maintenance_table("BTC").unwrap(),
+        );
+        let mut engine = Engine::new(schedule, Thresholds::new(dec!(1.5)).unwrap());
+        engine.set_mark(market("BTC"), Some(dec!(60_000)), 0);
+        engine.set_mark(okx_btc(), Some(dec!(60_000)), 0);
+        engine
+    }
+
+    #[test]
+    fn one_venue_moving_liquidates_positions_on_both() {
+        let mut engine = two_venue_engine();
+        let (id, _) = engine.create_account(dec!(20_000), 1).unwrap();
+        engine
+            .fill(id, market("BTC"), Side::Long, dec!(10), 2)
+            .unwrap();
+        engine
+            .fill(id, okx_btc(), Side::Short, dec!(10), 3)
+            .unwrap();
+        // 600,000 at 1.25% plus 600,000 at 0.4%.
+        let health = engine.view(id).unwrap().health.unwrap();
+        assert_eq!(health.maintenance_required, dec!(9_900));
+
+        // Only the short's venue moves. The long gains nothing to offset it.
+        let events = engine.set_mark(okx_btc(), Some(dec!(61_200)), 4);
+        let closed: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                Event::Liquidated { market, px, .. } => Some((market.clone(), *px)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            closed,
+            [(market("BTC"), dec!(60_000)), (okx_btc(), dec!(61_200))]
+        );
+        let view = engine.view(id).unwrap();
+        assert!(matches!(view.state, AccountState::Closed { .. }));
+        assert_eq!(view.collateral, dec!(8_000));
+    }
+
+    #[test]
+    fn position_past_the_last_size_bracket_is_refused() {
+        let mut engine = two_venue_engine();
+        let (id, _) = engine.create_account(dec!(1_000_000_000), 1).unwrap();
+        assert_eq!(
+            engine.fill(id, okx_btc(), Side::Long, dec!(2_000.01), 2),
+            Err(EngineError::PositionTooLarge {
+                size: dec!(2_000.01),
+                max: dec!(2_000)
+            })
+        );
+        assert!(engine.view(id).unwrap().positions.is_empty());
+        engine
+            .fill(id, okx_btc(), Side::Long, dec!(2_000), 3)
+            .unwrap();
     }
 
     #[test]

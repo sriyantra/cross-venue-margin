@@ -59,7 +59,9 @@ pub fn account_health(
     for (market, position) in account.positions() {
         let mark = mark_for(marks, market)?;
         let position_notional = position.notional(mark)?;
-        let maintenance = schedule.table(market)?.maintenance(position_notional)?;
+        let maintenance = schedule
+            .table(market)?
+            .maintenance(position.size(), position_notional)?;
 
         unrealized_pnl = add(unrealized_pnl, position.unrealized_pnl(mark)?)?;
         notional = add(notional, position_notional)?;
@@ -79,6 +81,7 @@ pub fn account_health(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::risk::SizeTable;
     use crate::risk::{Position, Side, TierTable, Venue};
     use rust_decimal::dec;
 
@@ -174,5 +177,34 @@ mod tests {
             account_health(&account(), &marks, &Schedule::new()),
             Err(RiskError::MissingSchedule(market("BTC")))
         );
+    }
+
+    #[test]
+    fn positions_on_two_venues_share_one_collateral_balance() {
+        let okx = MarketId::new(Venue::Okx, "BTC");
+        let mut schedule = schedule();
+        schedule.insert(
+            okx.clone(),
+            SizeTable::new(&[(dec!(10), dec!(0.004)), (dec!(50), dec!(0.005))]).unwrap(),
+        );
+        // Long 20 on one venue, short 20 on the other.
+        let mut account = Account::new(dec!(50_000));
+        account.set_position(
+            market("BTC"),
+            Position::new(Side::Long, dec!(20), dec!(60_000)).unwrap(),
+        );
+        account.set_position(
+            okx.clone(),
+            Position::new(Side::Short, dec!(20), dec!(60_100)).unwrap(),
+        );
+        let marks = Marks::from([(market("BTC"), dec!(61_000)), (okx, dec!(61_050))]);
+
+        let health = account_health(&account, &marks, &schedule).unwrap();
+        // +20,000 on the long, -19,000 on the short.
+        assert_eq!(health.unrealized_pnl, dec!(1_000));
+        assert_eq!(health.equity, dec!(51_000));
+        // Gross: 1,220,000 * 1.25% plus 1,221,000 * 0.5%. The hedge does
+        // not reduce either requirement.
+        assert_eq!(health.maintenance_required, dec!(15_250) + dec!(6_105));
     }
 }

@@ -3,7 +3,7 @@ use cross_venue_margin::config::Config;
 use cross_venue_margin::engine::task::{self, EngineHandle};
 use cross_venue_margin::engine::{Engine, Event};
 use cross_venue_margin::feed::Feeds;
-use cross_venue_margin::risk::{MarketId, Schedule, Thresholds, Venue};
+use cross_venue_margin::risk::{MarginTable, MarketId, Schedule, Thresholds, Venue};
 use cross_venue_margin::{server, venue};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -53,9 +53,11 @@ async fn main() -> Result<()> {
 
     let mut schedule = Schedule::new();
     for market in &markets {
-        let table = match market.venue {
-            Venue::Hyperliquid => venue::hyperliquid::maintenance_table(&market.coin),
-            Venue::Okx => None,
+        let table: Option<MarginTable> = match market.venue {
+            Venue::Hyperliquid => {
+                venue::hyperliquid::maintenance_table(&market.coin).map(Into::into)
+            }
+            Venue::Okx => venue::okx::maintenance_table(&market.coin).map(Into::into),
         };
         match table {
             Some(table) => {

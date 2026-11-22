@@ -31,7 +31,7 @@ use tracing::{debug, info, warn};
 use super::market::{MARK_CHECK_EVERY, Market};
 use crate::book::{Desync, Level, SideDiff};
 use crate::feed::Publisher;
-use crate::risk::Venue;
+use crate::risk::{SizeTable, Venue};
 
 const VENUE: Venue = Venue::Okx;
 
@@ -64,6 +64,46 @@ pub fn instrument(coin: &str) -> Option<Instrument> {
         inst_id: format!("{coin}-USDT-SWAP"),
         contract_value,
     })
+}
+
+/// Maintenance margin brackets for a coin's USDT perpetual in cross margin,
+/// from the venue's public position tiers endpoint as read on 2026-11-22.
+/// The venue lists them in contracts, and they are stored here in units of
+/// the coin. Only the first 12 of 99 tiers are kept, which covers positions
+/// up to 2,000 BTC and 25,000 ETH. Larger positions are refused.
+pub fn maintenance_table(coin: &str) -> Option<SizeTable> {
+    const RATES: [Decimal; 12] = [
+        dec!(0.004),
+        dec!(0.005),
+        dec!(0.0075),
+        dec!(0.0125),
+        dec!(0.0175),
+        dec!(0.0225),
+        dec!(0.0275),
+        dec!(0.0325),
+        dec!(0.0375),
+        dec!(0.0425),
+        dec!(0.0475),
+        dec!(0.0525),
+    ];
+    let max_contracts: [u32; 12] = match coin {
+        "BTC" => [
+            1_000, 5_000, 20_000, 40_000, 60_000, 80_000, 100_000, 120_000, 140_000, 160_000,
+            180_000, 200_000,
+        ],
+        "ETH" => [
+            5_000, 10_000, 25_000, 50_000, 75_000, 100_000, 125_000, 150_000, 175_000, 200_000,
+            225_000, 250_000,
+        ],
+        _ => return None,
+    };
+    let contract_value = instrument(coin)?.contract_value;
+    let brackets: Vec<(Decimal, Decimal)> = max_contracts
+        .iter()
+        .zip(RATES)
+        .map(|(contracts, rate)| (Decimal::from(*contracts) * contract_value, rate))
+        .collect();
+    SizeTable::new(&brackets).ok()
 }
 
 // ---------------------------------------------------------------------------
@@ -517,6 +557,21 @@ mod tests {
         );
         assert_eq!(instrument("ETH").unwrap().contract_value, dec!(0.1));
         assert_eq!(instrument("DOGE"), None);
+    }
+
+    #[test]
+    fn listed_coins_have_a_maintenance_table_in_coin_units() {
+        let btc = maintenance_table("BTC").unwrap();
+        // 1,000 contracts is 10 BTC, 5,000 is 50 BTC.
+        assert_eq!(btc.rate_for(dec!(10)), Ok(dec!(0.004)));
+        assert_eq!(btc.rate_for(dec!(10.01)), Ok(dec!(0.005)));
+        assert_eq!(btc.rate_for(dec!(2_000)), Ok(dec!(0.0525)));
+        assert!(btc.rate_for(dec!(2_000.01)).is_err());
+
+        let eth = maintenance_table("ETH").unwrap();
+        assert_eq!(eth.rate_for(dec!(500)), Ok(dec!(0.004)));
+        assert_eq!(eth.rate_for(dec!(25_000)), Ok(dec!(0.0525)));
+        assert!(maintenance_table("DOGE").is_none());
     }
 
     #[test]

@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc b594e58a1d3002e7abdc5f3a52ffd720aaf210cab8034b9eb62c2e5d187a4c16 # shrinks to (mut account, marks) = (Account { collateral: 0, positions: {MarketId { venue: Okx, coin: "SOL" }: Position { side: Short, size: 53.2931, entry_px: 0.01 }} }, {MarketId { venue: Hyperliquid, coin: "BTC" }: 0.01, MarketId { venue: Hyperliquid, coin: "ETH" }: 0.01, MarketId { venue: Okx, coin: "SOL" }: 0.01}), fills = [(2, Short, 46.7070)]

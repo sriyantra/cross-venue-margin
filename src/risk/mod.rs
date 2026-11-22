@@ -18,7 +18,7 @@ pub mod types;
 pub use health::{Health, account_health};
 pub use lifecycle::{AccountState, ThresholdError, Thresholds, Transition, step};
 pub use liquidation::{LiquidationPrice, liquidation_price};
-pub use schedule::{Schedule, ScheduleError, Tier, TierTable};
+pub use schedule::{MarginTable, Schedule, ScheduleError, SizeTable, SizeTier, Tier, TierTable};
 pub use types::{Account, Closed, MarketId, Marks, Position, PositionError, Side, Venue};
 
 /// Why a risk number could not be computed. Each of these means there is no
@@ -33,6 +33,8 @@ pub enum RiskError {
     InvalidMark { market: MarketId, mark: Decimal },
     #[error("no open position in {0}")]
     NoPosition(MarketId),
+    #[error("position size {size} is above the largest size the schedule covers, {max}")]
+    AboveSchedule { size: Decimal, max: Decimal },
     #[error("result is too small to represent")]
     Underflow,
     #[error("arithmetic overflow")]

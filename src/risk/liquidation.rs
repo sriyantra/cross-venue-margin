@@ -5,7 +5,7 @@ use serde::Serialize;
 
 use super::health::mark_for;
 use super::num::{add, div, mul, sub};
-use super::{Account, MarketId, Marks, RiskError, Schedule, Side, Tier};
+use super::{Account, MarginTable, MarketId, Marks, RiskError, Schedule, Side, Tier};
 
 /// Where one market's mark must go for the account to reach its maintenance
 /// margin, with every other mark held where it is.
@@ -28,9 +28,11 @@ pub enum LiquidationPrice {
 /// Solves `equity(px) = maintenance(px)` for the mark of `market`.
 ///
 /// In one tier the margin available is a straight line in the price:
-/// `base + deduction + px * size * (sign - rate)`. The rate and deduction
-/// change from tier to tier, so the answer is found by walking the tiers in
-/// the direction the price has to move.
+/// `base + deduction + px * size * (sign - rate)`. In a table keyed by
+/// notional the rate and deduction change from tier to tier, so the answer
+/// is found by walking the tiers in the direction the price has to move. In
+/// a table keyed by size the position stays in one tier at every price, so
+/// there is a single line to solve.
 pub fn liquidation_price(
     account: &Account,
     market: &MarketId,
@@ -40,7 +42,19 @@ pub fn liquidation_price(
     let position = account
         .position(market)
         .ok_or_else(|| RiskError::NoPosition(market.clone()))?;
-    let tiers = schedule.table(market)?.tiers();
+    let size = position.size();
+    let fixed;
+    let tiers = match schedule.table(market)? {
+        MarginTable::ByNotional(table) => table.tiers(),
+        MarginTable::BySize(table) => {
+            fixed = [Tier {
+                lower_bound: Decimal::ZERO,
+                rate: table.rate_for(size)?,
+                deduction: Decimal::ZERO,
+            }];
+            &fixed[..]
+        }
+    };
 
     // Everything that does not move with this market's price: collateral,
     // the other positions' PnL and maintenance, and this position's cost.
@@ -50,10 +64,11 @@ pub fn liquidation_price(
             continue;
         }
         let mark = mark_for(marks, other)?;
-        let maintenance = schedule.table(other)?.maintenance(held.notional(mark)?)?;
+        let maintenance = schedule
+            .table(other)?
+            .maintenance(held.size(), held.notional(mark)?)?;
         base = sub(add(base, held.unrealized_pnl(mark)?)?, maintenance)?;
     }
-    let size = position.size();
     let sign = position.side().sign();
     base = sub(base, mul(mul(sign, size)?, position.entry_px())?)?;
 
@@ -282,6 +297,46 @@ mod tests {
             liquidation_price(&short, &market("BTC"), &Marks::new(), &schedule()),
             Ok(LiquidationPrice::At(_))
         ));
+    }
+
+    #[test]
+    fn size_keyed_table_solves_one_line_at_the_position_tier() {
+        use crate::risk::SizeTable;
+        let okx = MarketId::new(Venue::Okx, "BTC");
+        let mut schedule = schedule();
+        schedule.insert(
+            okx.clone(),
+            SizeTable::new(&[(dec!(10), dec!(0.004)), (dec!(50), dec!(0.005))]).unwrap(),
+        );
+        // 20 coins sits in the 0.5% bracket at every price.
+        let mut long = Account::new(dec!(100_000));
+        long.set_position(
+            okx.clone(),
+            Position::new(Side::Long, dec!(20), dec!(60_000)).unwrap(),
+        );
+        let LiquidationPrice::At(px) =
+            liquidation_price(&long, &okx, &Marks::new(), &schedule).unwrap()
+        else {
+            panic!("expected a price");
+        };
+        // 100,000 + 20 * (px - 60,000) = 20 * px * 0.005
+        assert_eq!(px.round_dp(6), dec!(55_276.381910));
+        let at = Marks::from([(okx.clone(), px)]);
+        let health = account_health(&long, &at, &schedule).unwrap();
+        assert!(health.margin_available.abs() < dec!(0.000001));
+
+        let mut short = Account::new(dec!(100_000));
+        short.set_position(
+            okx.clone(),
+            Position::new(Side::Short, dec!(20), dec!(60_000)).unwrap(),
+        );
+        // 100,000 + 20 * (60,000 - px) = 20 * px * 0.005
+        let LiquidationPrice::At(px) =
+            liquidation_price(&short, &okx, &Marks::new(), &schedule).unwrap()
+        else {
+            panic!("expected a price");
+        };
+        assert_eq!(px.round_dp(6), dec!(64_676.616915));
     }
 
     #[test]

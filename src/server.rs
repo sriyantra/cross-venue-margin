@@ -226,6 +226,7 @@ fn engine_error(error: EngineError) -> Response {
         EngineError::NoMark(_) | EngineError::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
         EngineError::NegativeCollateral(_)
         | EngineError::UnsupportedMarket(_)
+        | EngineError::PositionTooLarge { .. }
         | EngineError::InvalidFill(_) => StatusCode::BAD_REQUEST,
         EngineError::Risk(_) => StatusCode::INTERNAL_SERVER_ERROR,
     };

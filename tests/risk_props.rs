@@ -3,7 +3,7 @@
 
 use cross_venue_margin::risk::{
     Account, AccountState, Health, LiquidationPrice, MarketId, Marks, Position, Schedule, Side,
-    Thresholds, TierTable, Venue, account_health, liquidation_price, step,
+    SizeTable, Thresholds, TierTable, Venue, account_health, liquidation_price, step,
 };
 use proptest::prelude::*;
 use rust_decimal::{Decimal, dec};
@@ -11,13 +11,20 @@ use rust_decimal::{Decimal, dec};
 const COINS: [&str; 3] = ["BTC", "ETH", "SOL"];
 const TOLERANCE: Decimal = dec!(0.000001);
 
+/// SOL sits on the second venue, so accounts span both.
 fn market(coin: &str) -> MarketId {
-    MarketId::new(Venue::Hyperliquid, coin)
+    let venue = if coin == "SOL" {
+        Venue::Okx
+    } else {
+        Venue::Hyperliquid
+    };
+    MarketId::new(venue, coin)
 }
 
 /// Tables whose bounds sit inside the notionals the generators produce, so
 /// positions land in every tier. Max leverage of 15 gives a rate that does
-/// not terminate in decimal.
+/// not terminate in decimal. SOL uses a table keyed by size, whose last
+/// bracket is wide enough for repeated fills to stack.
 fn schedule() -> Schedule {
     let table = |brackets: &[(Decimal, Decimal)]| TierTable::from_max_leverage(brackets).unwrap();
     let mut schedule = Schedule::new();
@@ -33,7 +40,16 @@ fn schedule() -> Schedule {
         market("ETH"),
         table(&[(dec!(0), dec!(25)), (dec!(100_000), dec!(15))]),
     );
-    schedule.insert(market("SOL"), table(&[(dec!(0), dec!(20))]));
+    schedule.insert(
+        market("SOL"),
+        SizeTable::new(&[
+            (dec!(1), dec!(0.004)),
+            (dec!(10), dec!(0.01)),
+            (dec!(100), dec!(0.03)),
+            (dec!(100_000), dec!(0.05)),
+        ])
+        .unwrap(),
+    );
     schedule
 }
 
@@ -165,7 +181,10 @@ proptest! {
         let (low, high) = (Decimal::new(a.min(b), 2), Decimal::new(a.max(b), 2));
         for coin in COINS {
             let table = schedule.table(&market(coin)).unwrap();
-            let (m_low, m_high) = (table.maintenance(low).unwrap(), table.maintenance(high).unwrap());
+            // Size is held at one coin, so a size-keyed table stays in one
+            // bracket and a notional-keyed table ignores it.
+            let m_low = table.maintenance(Decimal::ONE, low).unwrap();
+            let m_high = table.maintenance(Decimal::ONE, high).unwrap();
             prop_assert!(m_low <= m_high);
             // No rate here is above 5%, so no step can exceed 5% of the gap.
             prop_assert!(m_high - m_low <= (high - low) * dec!(0.05) + TOLERANCE);

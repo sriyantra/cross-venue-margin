@@ -5,9 +5,10 @@ computes margin for accounts whose positions span those venues on a single
 collateral balance.
 
 Status: stage 3 of 4, in progress. Two venues are connected, Hyperliquid and
-OKX, with live books and mark prices from both. Paper accounts are margined
-on Hyperliquid positions only. OKX positions are refused until its margin
-tiers are added, so the margin is not cross-venue yet.
+OKX, with live books and mark prices from both. A paper account can hold
+positions on both venues against one collateral balance, each margined by
+its own venue's rules and marked at its own venue's price. The event log
+and replay are not built yet.
 
 Accounts are paper accounts. The service places no orders and holds no funds.
 
@@ -50,6 +51,20 @@ Accounts are paper accounts. The service places no orders and holds no funds.
   using its rule that the maintenance rate is half the initial margin rate
   at max leverage. Other markets have no table and positions in them are
   refused.
+- OKX keys its tiers by position size instead. The rate of the tier a
+  position's size falls in applies to its whole notional, so the
+  requirement steps up when a fill crosses a tier bound. The BTC and ETH
+  tables hold the first 12 tiers from its public position tiers endpoint
+  (read on 2026-11-22), which covers 2,000 BTC and 25,000 ETH. Larger
+  positions are refused.
+- OKX perpetuals settle in USDT. One USDT is counted as one dollar of the
+  account's collateral, with no conversion rate.
+- OKX adds a liquidation fee to the maintenance requirement. That fee is
+  not modeled, so an OKX position here liquidates slightly later than it
+  would on the venue.
+- The Hyperliquid numbers are checked against the venue's own (see Test).
+  OKX account data is not public, so the OKX numbers are checked against
+  its documented formula only.
 - Equity is collateral plus unrealized profit and loss at the venue's mark.
   Funding and fees are not modeled.
 - Liquidation closes every position at the mark in one step. Real venues
@@ -159,7 +174,6 @@ cargo test
 1. Hyperliquid connector, book, API. Done.
 2. Risk engine: paper accounts, account health, liquidation price, and an
    explicit account state machine. Done.
-3. Second venue (OKX books and marks are done, its margin tiers are not),
-   an append-only event log in Postgres, and deterministic replay from that
-   log.
+3. Second venue (done), an append-only event log in Postgres, and
+   deterministic replay from that log.
 4. Docker image, metrics for feed-to-decision latency, deployment.

@@ -1,8 +1,14 @@
 //! Maintenance margin schedules.
 //!
-//! A schedule is data, not code. Each market has a table of notional
-//! brackets, and the maintenance margin for a position is
-//! `notional * rate - deduction` using the bracket its notional falls in.
+//! A schedule is data, not code. Each market has one table, and venues
+//! differ in what kind:
+//!
+//! - `TierTable` is keyed by notional. The margin is
+//!   `notional * rate - deduction` using the bracket the notional falls in,
+//!   so the bracket changes as the price moves.
+//! - `SizeTable` is keyed by position size. The margin is `notional * rate`
+//!   with the rate of the bracket the size falls in, applied to the whole
+//!   position. The bracket only changes when the position does.
 
 use std::collections::BTreeMap;
 
@@ -39,6 +45,10 @@ pub enum ScheduleError {
     LeverageTooLow(Decimal),
     #[error("max leverage must not rise as notional grows")]
     LeverageIncreasing,
+    #[error("maintenance rate must not fall as size grows")]
+    RateDecreasing,
+    #[error("size bound {0} must be above zero")]
+    NonPositiveBound(Decimal),
     #[error("tier values overflow")]
     Overflow,
 }
@@ -146,10 +156,100 @@ impl TierTable {
     }
 }
 
-/// The tier table of every market the engine knows.
+/// One size bracket: positions up to and including `max_size` pay `rate`
+/// on their whole notional.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SizeTier {
+    pub max_size: Decimal,
+    pub rate: Decimal,
+}
+
+/// A validated table keyed by position size, in units of the coin.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SizeTable {
+    tiers: Vec<SizeTier>,
+}
+
+impl SizeTable {
+    /// Builds a table from `(max_size, rate)` brackets in increasing order.
+    /// The last bracket's `max_size` is the largest position the table
+    /// covers.
+    pub fn new(brackets: &[(Decimal, Decimal)]) -> Result<Self, ScheduleError> {
+        let mut tiers: Vec<SizeTier> = Vec::with_capacity(brackets.len());
+        for &(max_size, rate) in brackets {
+            if max_size <= Decimal::ZERO {
+                return Err(ScheduleError::NonPositiveBound(max_size));
+            }
+            if rate <= Decimal::ZERO || rate >= Decimal::ONE {
+                return Err(ScheduleError::RateOutOfRange(rate));
+            }
+            if let Some(prev) = tiers.last() {
+                if max_size <= prev.max_size {
+                    return Err(ScheduleError::BoundsNotIncreasing);
+                }
+                if rate < prev.rate {
+                    return Err(ScheduleError::RateDecreasing);
+                }
+            }
+            tiers.push(SizeTier { max_size, rate });
+        }
+        if tiers.is_empty() {
+            return Err(ScheduleError::Empty);
+        }
+        Ok(Self { tiers })
+    }
+
+    pub fn tiers(&self) -> &[SizeTier] {
+        &self.tiers
+    }
+
+    /// The rate for a position of this size. A size exactly on a bound
+    /// belongs to the lower bracket. A size past the last bracket has no
+    /// rate.
+    pub fn rate_for(&self, size: Decimal) -> Result<Decimal, RiskError> {
+        match self.tiers.iter().find(|tier| size <= tier.max_size) {
+            Some(tier) => Ok(tier.rate),
+            None => Err(RiskError::AboveSchedule {
+                size,
+                max: self.tiers[self.tiers.len() - 1].max_size,
+            }),
+        }
+    }
+}
+
+/// A market's maintenance table, in whichever form its venue defines it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MarginTable {
+    ByNotional(TierTable),
+    BySize(SizeTable),
+}
+
+impl MarginTable {
+    /// Maintenance margin for a position of this size and notional.
+    pub fn maintenance(&self, size: Decimal, notional: Decimal) -> Result<Decimal, RiskError> {
+        match self {
+            MarginTable::ByNotional(table) => table.maintenance(notional),
+            MarginTable::BySize(table) => mul(notional, table.rate_for(size)?),
+        }
+    }
+}
+
+impl From<TierTable> for MarginTable {
+    fn from(table: TierTable) -> Self {
+        MarginTable::ByNotional(table)
+    }
+}
+
+impl From<SizeTable> for MarginTable {
+    fn from(table: SizeTable) -> Self {
+        MarginTable::BySize(table)
+    }
+}
+
+/// The maintenance table of every market the engine knows.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Schedule {
-    tables: BTreeMap<MarketId, TierTable>,
+    tables: BTreeMap<MarketId, MarginTable>,
 }
 
 impl Schedule {
@@ -157,11 +257,15 @@ impl Schedule {
         Self::default()
     }
 
-    pub fn insert(&mut self, market: MarketId, table: TierTable) -> Option<TierTable> {
-        self.tables.insert(market, table)
+    pub fn insert(
+        &mut self,
+        market: MarketId,
+        table: impl Into<MarginTable>,
+    ) -> Option<MarginTable> {
+        self.tables.insert(market, table.into())
     }
 
-    pub fn table(&self, market: &MarketId) -> Result<&TierTable, RiskError> {
+    pub fn table(&self, market: &MarketId) -> Result<&MarginTable, RiskError> {
         self.tables
             .get(market)
             .ok_or_else(|| RiskError::MissingSchedule(market.clone()))
@@ -250,6 +354,60 @@ mod tests {
         assert_eq!(
             TierTable::from_max_leverage(&[(dec!(0), dec!(0.5))]),
             Err(ScheduleError::LeverageTooLow(dec!(0.5)))
+        );
+    }
+
+    fn by_size() -> SizeTable {
+        SizeTable::new(&[(dec!(10), dec!(0.004)), (dec!(50), dec!(0.005))]).unwrap()
+    }
+
+    #[test]
+    fn size_table_applies_one_rate_to_the_whole_position() {
+        let table = MarginTable::from(by_size());
+        // 10 coins at 60,000 is still in the first bracket.
+        assert_eq!(table.maintenance(dec!(10), dec!(600_000)), Ok(dec!(2_400)));
+        // One step over, the whole position pays the second rate.
+        assert_eq!(
+            table.maintenance(dec!(10.01), dec!(600_600)),
+            Ok(dec!(3_003))
+        );
+        // The bracket follows size, not notional.
+        assert_eq!(
+            table.maintenance(dec!(1), dec!(9_000_000)),
+            Ok(dec!(36_000))
+        );
+    }
+
+    #[test]
+    fn size_past_the_last_bracket_has_no_rate() {
+        assert_eq!(by_size().rate_for(dec!(50)), Ok(dec!(0.005)));
+        assert_eq!(
+            by_size().rate_for(dec!(50.01)),
+            Err(RiskError::AboveSchedule {
+                size: dec!(50.01),
+                max: dec!(50)
+            })
+        );
+    }
+
+    #[test]
+    fn invalid_size_tables_are_rejected() {
+        assert_eq!(SizeTable::new(&[]), Err(ScheduleError::Empty));
+        assert_eq!(
+            SizeTable::new(&[(dec!(0), dec!(0.01))]),
+            Err(ScheduleError::NonPositiveBound(dec!(0)))
+        );
+        assert_eq!(
+            SizeTable::new(&[(dec!(10), dec!(0.01)), (dec!(10), dec!(0.02))]),
+            Err(ScheduleError::BoundsNotIncreasing)
+        );
+        assert_eq!(
+            SizeTable::new(&[(dec!(10), dec!(0.02)), (dec!(20), dec!(0.01))]),
+            Err(ScheduleError::RateDecreasing)
+        );
+        assert_eq!(
+            SizeTable::new(&[(dec!(10), dec!(1))]),
+            Err(ScheduleError::RateOutOfRange(dec!(1)))
         );
     }
 
