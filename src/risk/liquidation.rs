@@ -1,6 +1,7 @@
 //! Liquidation price of one position inside a cross-margined account.
 
 use rust_decimal::Decimal;
+use serde::Serialize;
 
 use super::health::mark_for;
 use super::num::{add, div, mul, sub};
@@ -8,7 +9,8 @@ use super::{Account, MarketId, Marks, RiskError, Schedule, Side, Tier};
 
 /// Where one market's mark must go for the account to reach its maintenance
 /// margin, with every other mark held where it is.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(tag = "type", content = "price", rename_all = "snake_case")]
 pub enum LiquidationPrice {
     /// Margin available is zero at this price and negative beyond it: below
     /// it for a long, above it for a short.

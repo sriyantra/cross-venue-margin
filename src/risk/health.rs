@@ -1,12 +1,13 @@
 //! Account health: equity against the maintenance margin it must cover.
 
 use rust_decimal::Decimal;
+use serde::Serialize;
 
 use super::num::{add, sub};
 use super::{Account, MarketId, Marks, RiskError, Schedule};
 
 /// An account's risk numbers at one set of mark prices.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct Health {
     /// Collateral plus unrealized profit and loss.
     pub equity: Decimal,

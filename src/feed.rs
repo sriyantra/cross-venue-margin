@@ -111,6 +111,13 @@ impl Feeds {
         self.marks.get(coin).map(|rx| rx.borrow().clone())
     }
 
+    /// Every market's mark receiver, for a task that watches all of them.
+    pub fn mark_receivers(&self) -> impl Iterator<Item = (&str, MarkRx)> {
+        self.marks
+            .iter()
+            .map(|(coin, rx)| (coin.as_str(), rx.clone()))
+    }
+
     pub fn coins(&self) -> impl Iterator<Item = &str> {
         self.books.keys().map(String::as_str)
     }

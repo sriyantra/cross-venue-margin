@@ -214,4 +214,30 @@ proptest! {
             state = next;
         }
     }
+
+    /// A fill at the mark moves value between collateral and positions but
+    /// never creates or destroys equity, and closing everything at the mark
+    /// turns all of the equity into collateral.
+    #[test]
+    fn fills_at_the_mark_conserve_equity(
+        (mut account, marks) in account_and_marks(),
+        fills in proptest::collection::vec((0usize..COINS.len(), side(), size()), 1..8),
+    ) {
+        let schedule = schedule();
+        let equity = |account: &Account| account_health(account, &marks, &schedule).unwrap().equity;
+        let start = equity(&account);
+
+        for (coin, side, size) in fills {
+            let target = market(COINS[coin]);
+            let before = (account.collateral, equity(&account));
+            let fill = Position::new(side, size, marks[&target]).unwrap();
+            let realized = account.apply_fill(target, fill).unwrap();
+            prop_assert_eq!(account.collateral, before.0 + realized);
+            prop_assert!((equity(&account) - before.1).abs() < TOLERANCE);
+        }
+
+        account.close_all(&marks).unwrap();
+        prop_assert!(!account.has_positions());
+        prop_assert!((account.collateral - start).abs() < TOLERANCE);
+    }
 }

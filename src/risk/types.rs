@@ -4,12 +4,15 @@ use std::collections::BTreeMap;
 use std::fmt;
 
 use rust_decimal::Decimal;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use super::RiskError;
-use super::num::{mul, sub};
+use super::health::mark_for;
+use super::num::{add, div, mul, sub};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Venue {
     Hyperliquid,
 }
@@ -23,7 +26,7 @@ impl fmt::Display for Venue {
 }
 
 /// One market on one venue. The same coin on two venues is two markets.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 pub struct MarketId {
     pub venue: Venue,
     pub coin: String,
@@ -44,7 +47,8 @@ impl fmt::Display for MarketId {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Side {
     Long,
     Short,
@@ -70,6 +74,9 @@ pub enum PositionError {
 
 /// An open position. The fields are private so a position with a zero or
 /// negative size or entry price cannot exist.
+///
+/// A fill has the same shape (a side, a size and a price), so fills are
+/// passed around as `Position` values too.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Position {
     side: Side,
@@ -151,6 +158,95 @@ impl Account {
     pub fn positions(&self) -> impl Iterator<Item = (&MarketId, &Position)> {
         self.positions.iter()
     }
+
+    pub fn has_positions(&self) -> bool {
+        !self.positions.is_empty()
+    }
+
+    /// Applies a fill and returns the profit or loss it realized.
+    ///
+    /// A fill on the same side grows the position and averages the entry
+    /// price. A fill on the other side closes that much of the position at
+    /// the fill price, moves the result into collateral, and opens whatever
+    /// is left over as a new position on the fill's side. On an error the
+    /// account is unchanged.
+    pub fn apply_fill(&mut self, market: MarketId, fill: Position) -> Result<Decimal, RiskError> {
+        let Some(held) = self.positions.get(&market).copied() else {
+            self.positions.insert(market, fill);
+            return Ok(Decimal::ZERO);
+        };
+
+        if held.side == fill.side {
+            let size = add(held.size, fill.size)?;
+            let cost = add(
+                mul(held.size, held.entry_px)?,
+                mul(fill.size, fill.entry_px)?,
+            )?;
+            let grown = Position {
+                side: held.side,
+                size,
+                entry_px: div(cost, size)?,
+            };
+            self.positions.insert(market, grown);
+            return Ok(Decimal::ZERO);
+        }
+
+        let closed = held.size.min(fill.size);
+        let realized = Position {
+            size: closed,
+            ..held
+        }
+        .unrealized_pnl(fill.entry_px)?;
+        let collateral = add(self.collateral, realized)?;
+        let remaining = sub(held.size, fill.size)?;
+        if remaining > Decimal::ZERO {
+            let reduced = Position {
+                size: remaining,
+                ..held
+            };
+            self.positions.insert(market, reduced);
+        } else if remaining < Decimal::ZERO {
+            let flipped = Position {
+                size: -remaining,
+                ..fill
+            };
+            self.positions.insert(market, flipped);
+        } else {
+            self.positions.remove(&market);
+        }
+        self.collateral = collateral;
+        Ok(realized)
+    }
+
+    /// Closes every position at its market's mark and moves the result into
+    /// collateral. On an error the account is unchanged.
+    pub fn close_all(&mut self, marks: &Marks) -> Result<Vec<Closed>, RiskError> {
+        let mut closed = Vec::with_capacity(self.positions.len());
+        let mut collateral = self.collateral;
+        for (market, position) in &self.positions {
+            let px = mark_for(marks, market)?;
+            let realized_pnl = position.unrealized_pnl(px)?;
+            collateral = add(collateral, realized_pnl)?;
+            closed.push(Closed {
+                market: market.clone(),
+                position: *position,
+                px,
+                realized_pnl,
+            });
+        }
+        self.positions.clear();
+        self.collateral = collateral;
+        Ok(closed)
+    }
+}
+
+/// One position closed by `Account::close_all`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Closed {
+    pub market: MarketId,
+    pub position: Position,
+    pub px: Decimal,
+    pub realized_pnl: Decimal,
 }
 
 /// The current mark price of each market, as published by that market's venue.
@@ -187,6 +283,100 @@ mod tests {
     fn overflow_is_an_error_not_a_panic() {
         let huge = Position::new(Side::Long, Decimal::MAX, dec!(1)).unwrap();
         assert_eq!(huge.notional(dec!(2)), Err(RiskError::Overflow));
+    }
+
+    fn btc() -> MarketId {
+        MarketId::new(Venue::Hyperliquid, "BTC")
+    }
+
+    fn pos(side: Side, size: Decimal, px: Decimal) -> Position {
+        Position::new(side, size, px).unwrap()
+    }
+
+    #[test]
+    fn same_side_fill_averages_the_entry() {
+        let mut account = Account::new(dec!(1_000));
+        account
+            .apply_fill(btc(), pos(Side::Long, dec!(1), dec!(100)))
+            .unwrap();
+        let realized = account
+            .apply_fill(btc(), pos(Side::Long, dec!(3), dec!(120)))
+            .unwrap();
+        assert_eq!(realized, dec!(0));
+        assert_eq!(
+            account.position(&btc()),
+            Some(&pos(Side::Long, dec!(4), dec!(115)))
+        );
+        assert_eq!(account.collateral, dec!(1_000));
+    }
+
+    #[test]
+    fn opposite_fill_reduces_and_realizes() {
+        let mut account = Account::new(dec!(1_000));
+        account
+            .apply_fill(btc(), pos(Side::Long, dec!(4), dec!(100)))
+            .unwrap();
+        let realized = account
+            .apply_fill(btc(), pos(Side::Short, dec!(1), dec!(90)))
+            .unwrap();
+        assert_eq!(realized, dec!(-10));
+        assert_eq!(account.collateral, dec!(990));
+        assert_eq!(
+            account.position(&btc()),
+            Some(&pos(Side::Long, dec!(3), dec!(100)))
+        );
+    }
+
+    #[test]
+    fn opposite_fill_of_equal_size_closes() {
+        let mut account = Account::new(dec!(1_000));
+        account
+            .apply_fill(btc(), pos(Side::Short, dec!(2), dec!(100)))
+            .unwrap();
+        let realized = account
+            .apply_fill(btc(), pos(Side::Long, dec!(2), dec!(95)))
+            .unwrap();
+        assert_eq!(realized, dec!(10));
+        assert!(!account.has_positions());
+    }
+
+    #[test]
+    fn larger_opposite_fill_flips_the_position() {
+        let mut account = Account::new(dec!(1_000));
+        account
+            .apply_fill(btc(), pos(Side::Long, dec!(1), dec!(100)))
+            .unwrap();
+        let realized = account
+            .apply_fill(btc(), pos(Side::Short, dec!(3), dec!(110)))
+            .unwrap();
+        assert_eq!(realized, dec!(10));
+        assert_eq!(account.collateral, dec!(1_010));
+        assert_eq!(
+            account.position(&btc()),
+            Some(&pos(Side::Short, dec!(2), dec!(110)))
+        );
+    }
+
+    #[test]
+    fn close_all_realizes_every_position_or_none() {
+        let eth = MarketId::new(Venue::Hyperliquid, "ETH");
+        let mut account = Account::new(dec!(1_000));
+        account.set_position(btc(), pos(Side::Long, dec!(1), dec!(100)));
+        account.set_position(eth.clone(), pos(Side::Short, dec!(2), dec!(50)));
+
+        let untouched = account.clone();
+        let only_btc = Marks::from([(btc(), dec!(90))]);
+        assert_eq!(
+            account.close_all(&only_btc),
+            Err(RiskError::MissingMark(eth.clone()))
+        );
+        assert_eq!(account, untouched);
+
+        let marks = Marks::from([(btc(), dec!(90)), (eth, dec!(40))]);
+        let closed = account.close_all(&marks).unwrap();
+        assert_eq!(closed.len(), 2);
+        assert_eq!(account.collateral, dec!(1_010));
+        assert!(!account.has_positions());
     }
 
     #[test]

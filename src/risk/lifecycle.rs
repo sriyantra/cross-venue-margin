@@ -5,12 +5,14 @@
 //! the time as an argument, so a recorded run replays to the same states.
 
 use rust_decimal::Decimal;
+use serde::Serialize;
 use thiserror::Error;
 
 use super::num::mul;
 use super::{Health, RiskError};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
 pub enum AccountState {
     Open,
     /// Equity is still above maintenance margin but inside the warning band.
@@ -55,6 +57,12 @@ impl Thresholds {
     pub fn margin_call_multiple(&self) -> Decimal {
         self.margin_call_multiple
     }
+
+    /// Whether equity is below the level where a margin call starts.
+    pub fn in_margin_call(&self, health: &Health) -> Result<bool, RiskError> {
+        let band = mul(health.maintenance_required, self.margin_call_multiple)?;
+        Ok(health.equity < band)
+    }
 }
 
 /// A change of state, for the event log.
@@ -84,7 +92,7 @@ pub fn step(
             AccountState::Liquidating { .. } => state,
             _ => AccountState::Liquidating { since: now },
         },
-        _ if in_margin_call(health, thresholds)? => match state {
+        _ if thresholds.in_margin_call(health)? => match state {
             AccountState::MarginCall { .. } => state,
             _ => AccountState::MarginCall { since: now },
         },
@@ -97,11 +105,6 @@ pub fn step(
         at: now,
     });
     Ok((next, transition))
-}
-
-fn in_margin_call(health: &Health, thresholds: &Thresholds) -> Result<bool, RiskError> {
-    let band = mul(health.maintenance_required, thresholds.margin_call_multiple)?;
-    Ok(health.equity < band)
 }
 
 #[cfg(test)]

@@ -18,7 +18,7 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use flate2::read::DeflateDecoder;
 use futures_util::{SinkExt, StreamExt};
-use rust_decimal::Decimal;
+use rust_decimal::{Decimal, dec};
 use serde::Deserialize;
 use serde_json::json;
 use thiserror::Error;
@@ -29,6 +29,7 @@ use tracing::{debug, info, warn};
 
 use crate::book::{Book, Desync, Level, SideDiff};
 use crate::feed::{BookView, MarkView, Publisher};
+use crate::risk::TierTable;
 
 pub const VENUE: &str = "hyperliquid";
 
@@ -47,6 +48,19 @@ const BACKOFF_START: Duration = Duration::from_millis(500);
 const BACKOFF_MAX: Duration = Duration::from_secs(30);
 /// Upper bound on one decompressed diff. Real diffs are a few kilobytes.
 const MAX_INFLATED_BYTES: u64 = 1 << 20;
+
+/// Maintenance margin table for a market, from the max-leverage brackets in
+/// the venue's margin tiers documentation as read on 2026-11-22. Markets
+/// that are not listed here have no table, and the engine refuses to open
+/// positions in them.
+pub fn maintenance_table(coin: &str) -> Option<TierTable> {
+    let brackets: &[(Decimal, Decimal)] = match coin {
+        "BTC" => &[(dec!(0), dec!(40)), (dec!(150_000_000), dec!(20))],
+        "ETH" => &[(dec!(0), dec!(25)), (dec!(100_000_000), dec!(15))],
+        _ => return None,
+    };
+    TierTable::from_max_leverage(brackets).ok()
+}
 
 // ---------------------------------------------------------------------------
 // Wire format
@@ -539,7 +553,19 @@ fn resync(coin: &str, market: &mut Market) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rust_decimal::dec;
+
+    #[test]
+    fn documented_markets_have_a_maintenance_table() {
+        assert_eq!(
+            maintenance_table("BTC").unwrap().maintenance(dec!(60_000)),
+            Ok(dec!(750))
+        );
+        assert_eq!(
+            maintenance_table("ETH").unwrap().maintenance(dec!(50_000)),
+            Ok(dec!(1_000))
+        );
+        assert!(maintenance_table("DOGE").is_none());
+    }
 
     #[test]
     fn decodes_snapshot() {

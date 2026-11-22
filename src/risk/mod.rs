@@ -19,7 +19,7 @@ pub use health::{Health, account_health};
 pub use lifecycle::{AccountState, ThresholdError, Thresholds, Transition, step};
 pub use liquidation::{LiquidationPrice, liquidation_price};
 pub use schedule::{Schedule, ScheduleError, Tier, TierTable};
-pub use types::{Account, MarketId, Marks, Position, PositionError, Side, Venue};
+pub use types::{Account, Closed, MarketId, Marks, Position, PositionError, Side, Venue};
 
 /// Why a risk number could not be computed. Each of these means there is no
 /// trustworthy answer, so the caller must not fall back to an old one.
