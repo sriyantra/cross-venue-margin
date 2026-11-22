@@ -4,24 +4,75 @@
 //! - `GET /book/{coin}`  the current book, once
 //! - `GET /mark/{coin}`  the venue's current mark price
 //! - `GET /ws/{coin}`    WebSocket: the current book, then every update
+//! - `POST /accounts`             open a paper account
+//! - `GET /accounts/{id}`         health, state and positions
+//! - `POST /accounts/{id}/fills`  fill a paper order at the mark
 //!
-//! Handlers only read from watch channels. They never touch a `Book`.
+//! Market data handlers only read from watch channels. They never touch a
+//! `Book`. Account handlers send a command to the engine task and wait for
+//! its reply. They never touch an account.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{Path, State};
+use axum::extract::{FromRef, Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Json, Router};
-use serde::Serialize;
+use rust_decimal::Decimal;
+use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
 
+use crate::engine::task::EngineHandle;
+use crate::engine::{AccountId, EngineError};
 use crate::feed::{BookRx, BookView, Feeds, MarkView, Slot};
+use crate::risk::{MarketId, Side, Venue};
+
+/// What every handler can reach. Each handler asks for only the part it
+/// needs, through the `FromRef` impls below.
+#[derive(Clone)]
+struct AppState {
+    feeds: Arc<Feeds>,
+    engine: EngineHandle,
+}
+
+impl FromRef<AppState> for Arc<Feeds> {
+    fn from_ref(state: &AppState) -> Self {
+        state.feeds.clone()
+    }
+}
+
+impl FromRef<AppState> for EngineHandle {
+    fn from_ref(state: &AppState) -> Self {
+        state.engine.clone()
+    }
+}
+
+/// Amounts are JSON strings. A JSON number would pass through a binary
+/// float on the way in.
+#[derive(Debug, Deserialize)]
+struct CreateAccount {
+    #[serde(with = "rust_decimal::serde::str")]
+    collateral: Decimal,
+}
+
+#[derive(Debug, Deserialize)]
+struct FillRequest {
+    venue: Venue,
+    coin: String,
+    side: Side,
+    #[serde(with = "rust_decimal::serde::str")]
+    size: Decimal,
+}
+
+#[derive(Debug, Serialize)]
+struct ErrorBody {
+    error: String,
+}
 
 /// What a client receives for one market, over REST or WebSocket.
 #[derive(Debug, Serialize)]
@@ -68,24 +119,31 @@ struct Health {
     markets: Vec<MarketHealth>,
 }
 
-pub fn router(feeds: Feeds) -> Router {
+pub fn router(feeds: Feeds, engine: EngineHandle) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/book/{coin}", get(book))
         .route("/mark/{coin}", get(mark))
         .route("/ws/{coin}", get(ws_upgrade))
-        .with_state(Arc::new(feeds))
+        .route("/accounts", post(create_account))
+        .route("/accounts/{id}", get(account))
+        .route("/accounts/{id}/fills", post(fill))
+        .with_state(AppState {
+            feeds: Arc::new(feeds),
+            engine,
+        })
 }
 
 /// Serves the API until `shutdown` is cancelled.
 pub async fn serve(
     bind: SocketAddr,
     feeds: Feeds,
+    engine: EngineHandle,
     shutdown: CancellationToken,
 ) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(bind).await?;
     info!(addr = %listener.local_addr()?, "api listening");
-    axum::serve(listener, router(feeds))
+    axum::serve(listener, router(feeds, engine))
         .with_graceful_shutdown(async move { shutdown.cancelled().await })
         .await?;
     Ok(())
@@ -146,6 +204,55 @@ async fn mark(State(feeds): State<Arc<Feeds>>, Path(coin): Path<String>) -> Resp
             Json(MarkMessage::Stale { coin: &coin }),
         )
             .into_response(),
+    }
+}
+
+fn engine_error(error: EngineError) -> Response {
+    let status = match &error {
+        EngineError::UnknownAccount(_) => StatusCode::NOT_FOUND,
+        EngineError::AccountClosed(_) | EngineError::InsufficientMargin => StatusCode::CONFLICT,
+        EngineError::NoMark(_) | EngineError::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
+        EngineError::NegativeCollateral(_)
+        | EngineError::UnsupportedMarket(_)
+        | EngineError::InvalidFill(_) => StatusCode::BAD_REQUEST,
+        EngineError::Risk(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    let body = ErrorBody {
+        error: error.to_string(),
+    };
+    (status, Json(body)).into_response()
+}
+
+async fn create_account(
+    State(engine): State<EngineHandle>,
+    Json(body): Json<CreateAccount>,
+) -> Response {
+    match engine.create_account(body.collateral).await {
+        Ok(view) => (StatusCode::CREATED, Json(view)).into_response(),
+        Err(error) => engine_error(error),
+    }
+}
+
+async fn account(State(engine): State<EngineHandle>, Path(id): Path<u64>) -> Response {
+    match engine.get(AccountId(id)).await {
+        Ok(Some(view)) => Json(view).into_response(),
+        Ok(None) => engine_error(EngineError::UnknownAccount(AccountId(id))),
+        Err(error) => engine_error(error),
+    }
+}
+
+async fn fill(
+    State(engine): State<EngineHandle>,
+    Path(id): Path<u64>,
+    Json(body): Json<FillRequest>,
+) -> Response {
+    let market = MarketId::new(body.venue, body.coin);
+    match engine
+        .fill(AccountId(id), market, body.side, body.size)
+        .await
+    {
+        Ok(view) => Json(view).into_response(),
+        Err(error) => engine_error(error),
     }
 }
 

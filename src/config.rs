@@ -3,6 +3,7 @@
 use std::net::SocketAddr;
 
 use anyhow::{Context, Result, bail};
+use rust_decimal::Decimal;
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -12,6 +13,9 @@ pub struct Config {
     pub coins: Vec<String>,
     /// Address the HTTP/WebSocket API listens on.
     pub bind: SocketAddr,
+    /// A margin call starts when equity falls below maintenance margin
+    /// times this number.
+    pub margin_call_multiple: Decimal,
 }
 
 impl Config {
@@ -34,10 +38,16 @@ impl Config {
             .parse()
             .context("BIND must be a socket address such as 127.0.0.1:8080")?;
 
+        let margin_call_multiple = std::env::var("MARGIN_CALL_MULTIPLE")
+            .unwrap_or_else(|_| "1.5".into())
+            .parse()
+            .context("MARGIN_CALL_MULTIPLE must be a decimal such as 1.5")?;
+
         Ok(Self {
             hl_ws_url,
             coins,
             bind,
+            margin_call_multiple,
         })
     }
 }

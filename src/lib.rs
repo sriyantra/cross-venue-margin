@@ -2,7 +2,8 @@
 //!
 //! One venue connector (Hyperliquid) keeps an in-memory L2 book and the
 //! venue's mark price per market, served over an HTTP/WebSocket API. The
-//! `risk` module computes account health and liquidation prices.
+//! `risk` module computes account health and liquidation prices, and the
+//! `engine` module runs paper accounts against the live marks.
 
 pub mod book;
 pub mod config;
