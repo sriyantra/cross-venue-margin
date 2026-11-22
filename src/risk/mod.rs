@@ -8,10 +8,12 @@
 use rust_decimal::Decimal;
 use thiserror::Error;
 
+pub mod health;
 mod num;
 pub mod schedule;
 pub mod types;
 
+pub use health::{Health, account_health};
 pub use schedule::{Schedule, ScheduleError, Tier, TierTable};
 pub use types::{Account, MarketId, Marks, Position, PositionError, Side, Venue};
 
