@@ -2,6 +2,7 @@
 //!
 //! - `GET /health`       liveness of every tracked market
 //! - `GET /book/{coin}`  the current book, once
+//! - `GET /mark/{coin}`  the venue's current mark price
 //! - `GET /ws/{coin}`    WebSocket: the current book, then every update
 //!
 //! Handlers only read from watch channels. They never touch a `Book`.
@@ -20,7 +21,7 @@ use serde::Serialize;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
 
-use crate::feed::{BookRx, BookView, Feeds, Slot};
+use crate::feed::{BookRx, BookView, Feeds, MarkView, Slot};
 
 /// What a client receives for one market, over REST or WebSocket.
 #[derive(Debug, Serialize)]
@@ -43,10 +44,19 @@ impl<'a> BookMessage<'a> {
     }
 }
 
+/// What a client receives for one market's mark price.
+#[derive(Debug, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum MarkMessage<'a> {
+    Mark(&'a MarkView),
+    Stale { coin: &'a str },
+}
+
 #[derive(Debug, Serialize)]
 struct MarketHealth {
     coin: String,
     live: bool,
+    mark_live: bool,
     /// Milliseconds between the venue timestamp of the last applied message
     /// and this machine's clock.
     age_ms: Option<u64>,
@@ -62,6 +72,7 @@ pub fn router(feeds: Feeds) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/book/{coin}", get(book))
+        .route("/mark/{coin}", get(mark))
         .route("/ws/{coin}", get(ws_upgrade))
         .with_state(Arc::new(feeds))
 }
@@ -96,13 +107,14 @@ async fn health(State(feeds): State<Arc<Feeds>>) -> Response {
             MarketHealth {
                 coin: coin.to_string(),
                 live: slot.is_some(),
+                mark_live: feeds.latest_mark(coin).flatten().is_some(),
                 age_ms: slot.map(|view| now.saturating_sub(view.time)),
             }
         })
         .collect();
     markets.sort_by(|a, b| a.coin.cmp(&b.coin));
 
-    let ok = markets.iter().all(|m| m.live);
+    let ok = markets.iter().all(|m| m.live && m.mark_live);
     let status = if ok {
         StatusCode::OK
     } else {
@@ -122,6 +134,18 @@ async fn book(State(feeds): State<Arc<Feeds>>, Path(coin): Path<String>) -> Resp
             };
             (status, Json(BookMessage::new(&coin, &slot))).into_response()
         }
+    }
+}
+
+async fn mark(State(feeds): State<Arc<Feeds>>, Path(coin): Path<String>) -> Response {
+    match feeds.latest_mark(&coin) {
+        None => (StatusCode::NOT_FOUND, "unknown market").into_response(),
+        Some(Some(view)) => Json(MarkMessage::Mark(&view)).into_response(),
+        Some(None) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(MarkMessage::Stale { coin: &coin }),
+        )
+            .into_response(),
     }
 }
 

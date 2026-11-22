@@ -3,7 +3,7 @@
 
 use std::time::Duration;
 
-use cross_venue_margin::feed::{BookRx, Feeds};
+use cross_venue_margin::feed::{BookRx, Feeds, MarkRx};
 use cross_venue_margin::venue::hyperliquid;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
@@ -69,13 +69,52 @@ async fn wait_for(rx: &mut BookRx, want: impl Fn(Option<u64>) -> bool) -> Option
     slot.as_ref().map(|v| v.time)
 }
 
-async fn start() -> (TcpListener, BookRx, CancellationToken) {
+fn mark(px: &str) -> Message {
+    let body = json!({ "channel": "activeAssetCtx", "data": {
+        "coin": "BTC", "ctx": { "markPx": px, "oraclePx": px, "funding": "0" },
+    }});
+    Message::text(body.to_string())
+}
+
+/// Reads the two subscriptions the connector sends for a market on connect.
+async fn expect_subscriptions(venue: &mut Venue) {
+    let book = expect_method(venue, "subscribe").await;
+    assert_eq!(book["subscription"], json!({ "type": "l2", "c": "BTC" }));
+    let ctx = expect_method(venue, "subscribe").await;
+    assert_eq!(
+        ctx["subscription"],
+        json!({ "type": "activeAssetCtx", "coin": "BTC" })
+    );
+}
+
+async fn wait_for_mark(rx: &mut MarkRx, want: Option<&str>) {
+    let want = want.map(|px| px.parse().unwrap());
+    tokio::time::timeout(
+        WAIT,
+        rx.wait_for(|slot| slot.as_ref().map(|view| view.mark) == want),
+    )
+    .await
+    .expect("timed out waiting for mark state")
+    .unwrap();
+}
+
+async fn start_with_marks() -> (TcpListener, BookRx, MarkRx, CancellationToken) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("ws://{}", listener.local_addr().unwrap());
     let (feeds, publishers) = Feeds::channels(&["BTC".to_string()]);
     let shutdown = CancellationToken::new();
     tokio::spawn(hyperliquid::run(url, publishers, shutdown.clone()));
-    (listener, feeds.subscribe("BTC").unwrap(), shutdown)
+    (
+        listener,
+        feeds.subscribe("BTC").unwrap(),
+        feeds.subscribe_mark("BTC").unwrap(),
+        shutdown,
+    )
+}
+
+async fn start() -> (TcpListener, BookRx, CancellationToken) {
+    let (listener, book, _mark, shutdown) = start_with_marks().await;
+    (listener, book, shutdown)
 }
 
 #[tokio::test]
@@ -83,8 +122,7 @@ async fn bad_diff_marks_book_stale_then_resubscribes() {
     let (listener, mut rx, shutdown) = start().await;
     let mut venue = accept(&listener).await;
 
-    let sub = expect_method(&mut venue, "subscribe").await;
-    assert_eq!(sub["subscription"], json!({ "type": "l2", "c": "BTC" }));
+    expect_subscriptions(&mut venue).await;
 
     venue.send(snapshot(100, "99", "101")).await.unwrap();
     assert_eq!(wait_for(&mut rx, |t| t == Some(100)).await, Some(100));
@@ -110,7 +148,7 @@ async fn dropped_connection_marks_book_stale_then_reconnects() {
     let (listener, mut rx, shutdown) = start().await;
 
     let mut first = accept(&listener).await;
-    expect_method(&mut first, "subscribe").await;
+    expect_subscriptions(&mut first).await;
     first.send(snapshot(100, "99", "101")).await.unwrap();
     wait_for(&mut rx, |t| t == Some(100)).await;
 
@@ -118,9 +156,36 @@ async fn dropped_connection_marks_book_stale_then_reconnects() {
     assert_eq!(wait_for(&mut rx, |t| t.is_none()).await, None);
 
     let mut second = accept(&listener).await;
-    expect_method(&mut second, "subscribe").await;
+    expect_subscriptions(&mut second).await;
     second.send(snapshot(200, "99", "101")).await.unwrap();
     assert_eq!(wait_for(&mut rx, |t| t == Some(200)).await, Some(200));
+
+    shutdown.cancel();
+}
+
+#[tokio::test]
+async fn mark_is_published_and_withdrawn_on_disconnect() {
+    let (listener, mut book, mut marks, shutdown) = start_with_marks().await;
+
+    let mut first = accept(&listener).await;
+    expect_subscriptions(&mut first).await;
+    first.send(mark("60787.0")).await.unwrap();
+    wait_for_mark(&mut marks, Some("60787.0")).await;
+
+    // A book desync rebuilds the book and leaves the mark alone.
+    first.send(snapshot(100, "99", "101")).await.unwrap();
+    wait_for(&mut book, |t| t == Some(100)).await;
+    first.send(diff(101, &[5])).await.unwrap();
+    wait_for(&mut book, |t| t.is_none()).await;
+    assert!(marks.borrow().is_some());
+
+    drop(first);
+    wait_for_mark(&mut marks, None).await;
+
+    let mut second = accept(&listener).await;
+    expect_subscriptions(&mut second).await;
+    second.send(mark("60800.5")).await.unwrap();
+    wait_for_mark(&mut marks, Some("60800.5")).await;
 
     shutdown.cancel();
 }

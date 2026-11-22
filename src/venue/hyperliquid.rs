@@ -2,7 +2,8 @@
 //!
 //! Subscribes to the `l2` channel, which sends one full snapshot per market
 //! followed by diffs. Diffs normally arrive base64 encoded and compressed
-//! with raw DEFLATE.
+//! with raw DEFLATE. Also subscribes to `activeAssetCtx`, which carries the
+//! venue's mark price for one market.
 //!
 //! The module has two halves. `decode` is pure: text frame in, `Event` out.
 //! `run` is the I/O loop: it owns the socket and the books, and it is the
@@ -27,7 +28,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::book::{Book, Desync, Level, SideDiff};
-use crate::feed::{BookTx, BookView};
+use crate::feed::{BookView, MarkView, Publisher};
 
 pub const VENUE: &str = "hyperliquid";
 
@@ -36,6 +37,10 @@ const PING_EVERY: Duration = Duration::from_secs(15);
 /// If no frame of any kind arrives for this long, treat the connection as
 /// dead even if the socket still looks open.
 const STALE_AFTER: Duration = Duration::from_secs(10);
+/// A mark price that has not been refreshed for this long is withdrawn.
+const MARK_STALE_AFTER: Duration = Duration::from_secs(10);
+/// How often to look for marks that have gone stale.
+const MARK_CHECK_EVERY: Duration = Duration::from_secs(1);
 /// Minimum gap between resubscribes for one market.
 const RESYNC_THROTTLE: Duration = Duration::from_secs(1);
 const BACKOFF_START: Duration = Duration::from_millis(500);
@@ -96,6 +101,19 @@ struct WireUpdate {
     s: Decimal,
 }
 
+/// Payload of the `activeAssetCtx` channel. Only the mark price is read.
+#[derive(Debug, Deserialize)]
+struct WireAssetCtx {
+    coin: String,
+    ctx: WireCtx,
+}
+
+#[derive(Debug, Deserialize)]
+struct WireCtx {
+    #[serde(rename = "markPx")]
+    mark_px: Decimal,
+}
+
 /// A decoded frame, in terms the rest of the program understands.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Event {
@@ -110,6 +128,10 @@ pub enum Event {
         time: u64,
         bids: SideDiff,
         asks: SideDiff,
+    },
+    Mark {
+        coin: String,
+        mark: Decimal,
     },
     Pong,
     Subscribed,
@@ -143,6 +165,13 @@ pub fn decode(text: &str) -> Result<Event, DecodeError> {
                 Ok(diff_event(serde_json::from_slice(&json)?))
             }
         },
+        "activeAssetCtx" => {
+            let ctx: WireAssetCtx = serde_json::from_value(envelope.data)?;
+            Ok(Event::Mark {
+                coin: ctx.coin,
+                mark: ctx.ctx.mark_px,
+            })
+        }
         "pong" => Ok(Event::Pong),
         "subscriptionResponse" => Ok(Event::Subscribed),
         "error" => Ok(Event::VenueError(envelope.data.to_string())),
@@ -219,39 +248,85 @@ enum SessionEnd {
 /// One market's state inside the connector task.
 struct Market {
     book: Book,
-    publisher: BookTx,
+    publisher: Publisher,
     last_resync: Option<Instant>,
+    /// When the current mark arrived. `None` while no mark is published.
+    last_mark: Option<Instant>,
 }
 
 impl Market {
+    fn new(coin: String, publisher: Publisher) -> Self {
+        Self {
+            book: Book::new(coin),
+            publisher,
+            last_resync: None,
+            last_mark: None,
+        }
+    }
+
     fn publish(&self) {
         let view = BookView::from_book(VENUE, &self.book).map(Arc::new);
         // `send_replace` stores the value even when nobody is listening yet.
-        self.publisher.send_replace(view);
+        self.publisher.book.send_replace(view);
     }
 
     fn invalidate(&mut self) {
         self.book.reset();
-        self.publisher.send_replace(None);
+        self.publisher.book.send_replace(None);
+    }
+
+    /// Publishes a mark. The venue repeats an unchanged mark about once a
+    /// second, so readers are only woken when the price is different.
+    fn set_mark(&mut self, mark: Decimal, now: Instant) {
+        if mark <= Decimal::ZERO {
+            warn!(venue = VENUE, coin = self.book.coin(), %mark, "mark is not a price");
+            self.invalidate_mark();
+            return;
+        }
+        self.last_mark = Some(now);
+        let view = MarkView {
+            venue: VENUE,
+            coin: self.book.coin().to_string(),
+            mark,
+        };
+        self.publisher.mark.send_if_modified(|slot| {
+            if slot.as_ref() == Some(&view) {
+                return false;
+            }
+            *slot = Some(view);
+            true
+        });
+    }
+
+    fn invalidate_mark(&mut self) {
+        self.last_mark = None;
+        self.publisher
+            .mark
+            .send_if_modified(|slot| slot.take().is_some());
+    }
+
+    /// Withdraws a mark the venue has stopped refreshing. Returns whether it
+    /// did.
+    fn expire_mark(&mut self, now: Instant) -> bool {
+        let stale = self
+            .last_mark
+            .is_some_and(|at| now.duration_since(at) >= MARK_STALE_AFTER);
+        if stale {
+            self.invalidate_mark();
+        }
+        stale
     }
 }
 
 /// Runs the connector until `shutdown` is cancelled.
 ///
 /// Reconnects forever with exponential backoff. Every reconnect starts from
-/// empty books, and readers see `None` for each market until a fresh
-/// snapshot arrives.
-pub async fn run(url: String, publishers: HashMap<String, BookTx>, shutdown: CancellationToken) {
+/// empty books and no marks, and readers see `None` for each market until
+/// fresh data arrives.
+pub async fn run(url: String, publishers: HashMap<String, Publisher>, shutdown: CancellationToken) {
     let mut markets: HashMap<String, Market> = publishers
         .into_iter()
-        .map(|(coin, publisher)| {
-            let market = Market {
-                book: Book::new(coin.clone()),
-                publisher,
-                last_resync: None,
-            };
-            (coin, market)
-        })
+        .map(|(coin, publisher)| (coin.clone(), Market::new(coin, publisher)))
         .collect();
 
     let mut backoff = BACKOFF_START;
@@ -261,6 +336,7 @@ pub async fn run(url: String, publishers: HashMap<String, BookTx>, shutdown: Can
 
         for market in markets.values_mut() {
             market.invalidate();
+            market.invalidate_mark();
         }
 
         match outcome {
@@ -290,6 +366,14 @@ fn subscription(method: &str, coin: &str) -> Message {
     Message::text(body.to_string())
 }
 
+fn mark_subscription(coin: &str) -> Message {
+    let body = json!({
+        "method": "subscribe",
+        "subscription": { "type": "activeAssetCtx", "coin": coin },
+    });
+    Message::text(body.to_string())
+}
+
 async fn session(
     url: &str,
     markets: &mut HashMap<String, Market>,
@@ -304,8 +388,11 @@ async fn session(
 
     for coin in markets.keys() {
         ws.send(subscription("subscribe", coin)).await?;
+        ws.send(mark_subscription(coin)).await?;
     }
 
+    let mut mark_check = tokio::time::interval(MARK_CHECK_EVERY);
+    mark_check.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut ping = tokio::time::interval(PING_EVERY);
     ping.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut last_frame = Instant::now();
@@ -322,6 +409,14 @@ async fn session(
             }
             _ = ping.tick() => {
                 ws.send(Message::text(json!({ "method": "ping" }).to_string())).await?;
+            }
+            _ = mark_check.tick() => {
+                let now = Instant::now();
+                for (coin, market) in markets.iter_mut() {
+                    if market.expire_mark(now) {
+                        warn!(venue = VENUE, coin, "mark went stale");
+                    }
+                }
             }
             _ = tokio::time::sleep_until(last_frame + STALE_AFTER) => {
                 return Err(SessionError::Stale(STALE_AFTER));
@@ -359,7 +454,10 @@ fn handle_text(
             warn!(venue = VENUE, %error, "undecodable frame, resyncing every market");
             return markets
                 .iter_mut()
-                .filter_map(|(coin, market)| resync(coin, market))
+                .filter_map(|(coin, market)| {
+                    market.invalidate_mark();
+                    resync(coin, market)
+                })
                 .collect();
         }
     };
@@ -409,6 +507,12 @@ fn handle_text(
                     resync(&coin, market).into_iter().collect()
                 }
             }
+        }
+        Event::Mark { coin, mark } => {
+            if let Some(market) = markets.get_mut(&coin) {
+                market.set_mark(mark, Instant::now());
+            }
+            Vec::new()
         }
         Event::VenueError(message) => {
             warn!(venue = VENUE, message, "venue reported an error");
@@ -508,6 +612,71 @@ mod tests {
             }
             other => panic!("expected a diff, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn decodes_mark() {
+        // Shape recorded from the live feed on 2026-11-22.
+        let frame = r#"{"channel":"activeAssetCtx","data":{"coin":"BTC","ctx":{
+            "funding":"0.0000020754","openInterest":"39525.79214","prevDayPx":"60252.0",
+            "dayNtlVlm":"3172722573.4906549454","premium":"-0.0004801052",
+            "oraclePx":"60820.0","markPx":"60787.0","midPx":"60784.5",
+            "impactPxs":["60784.0","60790.8"],"dayBaseVlm":"52784.00396"}}}"#;
+        assert_eq!(
+            decode(frame).unwrap(),
+            Event::Mark {
+                coin: "BTC".into(),
+                mark: dec!(60787.0)
+            }
+        );
+    }
+
+    fn market() -> (Market, crate::feed::MarkRx) {
+        let (feeds, mut publishers) = crate::feed::Feeds::channels(&["BTC".to_string()]);
+        let market = Market::new("BTC".into(), publishers.remove("BTC").unwrap());
+        (market, feeds.subscribe_mark("BTC").unwrap())
+    }
+
+    #[test]
+    fn unchanged_mark_does_not_wake_readers() {
+        let (mut market, mut rx) = market();
+        let now = Instant::now();
+
+        market.set_mark(dec!(100), now);
+        assert!(rx.has_changed().unwrap());
+        assert_eq!(rx.borrow_and_update().as_ref().unwrap().mark, dec!(100));
+
+        market.set_mark(dec!(100), now);
+        assert!(!rx.has_changed().unwrap());
+
+        market.set_mark(dec!(101), now);
+        assert!(rx.has_changed().unwrap());
+    }
+
+    #[test]
+    fn mark_expires_when_the_venue_stops_refreshing_it() {
+        let (mut market, rx) = market();
+        let start = Instant::now();
+        market.set_mark(dec!(100), start);
+
+        assert!(!market.expire_mark(start + MARK_STALE_AFTER - Duration::from_millis(1)));
+        assert!(rx.borrow().is_some());
+
+        // A repeat of the same price still counts as a refresh.
+        market.set_mark(dec!(100), start + Duration::from_secs(5));
+        assert!(!market.expire_mark(start + MARK_STALE_AFTER));
+
+        assert!(market.expire_mark(start + Duration::from_secs(5) + MARK_STALE_AFTER));
+        assert!(rx.borrow().is_none());
+        assert!(!market.expire_mark(start + Duration::from_secs(60)));
+    }
+
+    #[test]
+    fn non_positive_mark_withdraws_the_mark() {
+        let (mut market, rx) = market();
+        market.set_mark(dec!(100), Instant::now());
+        market.set_mark(dec!(0), Instant::now());
+        assert!(rx.borrow().is_none());
     }
 
     #[test]

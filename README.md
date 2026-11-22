@@ -4,8 +4,9 @@ A Rust service that keeps live order books from more than one trading venue and
 computes margin for accounts whose positions span those venues on a single
 collateral balance.
 
-Status: stage 1 of 4. One venue (Hyperliquid) is connected. The risk engine
-and the second venue are not built yet.
+Status: stage 2 of 4, in progress. One venue (Hyperliquid) is connected. The
+risk calculations exist as a tested library but are not yet wired to the live
+feed or the API. The second venue is not built yet.
 
 ## What works today
 
@@ -18,7 +19,12 @@ and the second venue are not built yet.
   watchdog that drops a connection that has gone quiet.
 - Readers never see a book that is known to be wrong. While a book is being
   rebuilt, the API reports it as stale.
-- HTTP and WebSocket API over the current books.
+- The venue's mark price per market (`activeAssetCtx`), withdrawn if the
+  venue stops refreshing it.
+- HTTP and WebSocket API over the current books and marks.
+- Risk core (`src/risk`), library only for now: account health under gross
+  cross margin, tiered maintenance schedules, liquidation price per position,
+  and an account state machine (open, margin call, liquidating, closed).
 
 ## Run
 
@@ -39,8 +45,9 @@ Environment:
 
 | Route              | Returns                                              |
 | ------------------ | ---------------------------------------------------- |
-| `GET /health`      | Per-market liveness and age. 503 if any market is stale |
+| `GET /health`      | Per-market liveness and age. 503 if any book or mark is stale |
 | `GET /book/{coin}` | The current book. 503 with `{"type":"stale"}` if not live |
+| `GET /mark/{coin}` | The venue's mark price. 503 with `{"type":"stale"}` if not live |
 | `GET /ws/{coin}`   | WebSocket: the current book, then every update       |
 
 ```sh
@@ -73,7 +80,10 @@ cargo test
 - `tests/replay.rs` replays a recorded BTC session and checks ordering,
   depth, and uncrossed invariants after every message.
 - `tests/connector.rs` runs the connector against a local fake venue to
-  cover desync recovery and reconnect.
+  cover desync recovery, reconnect, and mark publication.
+- `tests/risk_props.rs` holds property tests for the risk core: health is
+  additive over positions, margin available is zero at the liquidation
+  price, and the state machine always matches the latest health reading.
 
 ## Roadmap
 

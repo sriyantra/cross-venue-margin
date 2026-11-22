@@ -1,7 +1,8 @@
 //! Cross-venue margin monitor.
 //!
-//! Stage 1: one venue connector (Hyperliquid), an in-memory L2 book per
-//! market, and an HTTP/WebSocket API that serves the current book.
+//! One venue connector (Hyperliquid) keeps an in-memory L2 book and the
+//! venue's mark price per market, served over an HTTP/WebSocket API. The
+//! `risk` module computes account health and liquidation prices.
 
 pub mod book;
 pub mod config;
