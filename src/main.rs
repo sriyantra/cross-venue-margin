@@ -27,6 +27,22 @@ async fn log_events(mut events: mpsc::Receiver<Event>) {
     }
 }
 
+/// Resolves on Ctrl-C, or on SIGTERM, which is what a container runtime
+/// sends to stop a process.
+async fn stop_signal() -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut terminate = signal(SignalKind::terminate())?;
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => result,
+            _ = terminate.recv() => Ok(()),
+        }
+    }
+    #[cfg(not(unix))]
+    tokio::signal::ctrl_c().await
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -131,7 +147,7 @@ async fn main() -> Result<()> {
         shutdown.clone(),
     ));
 
-    tokio::signal::ctrl_c().await?;
+    stop_signal().await?;
     info!("shutdown requested");
     shutdown.cancel();
 
