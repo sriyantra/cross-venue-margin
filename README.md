@@ -130,6 +130,11 @@ cargo test
   additive over positions, margin available is zero at the liquidation
   price, fills at the mark conserve equity, and the state machine always
   matches the latest health reading.
+- `tests/venue_parity.rs` compares the risk core with Hyperliquid's own
+  numbers for 11 real accounts recorded from its public API on 2026-11-22
+  (addresses removed). Maintenance margin and every liquidation price must
+  match. The sample holds only accounts with BTC and ETH cross positions and
+  no collateral outside the perp balance.
 - `tests/engine.rs` runs the engine task against hand-driven mark channels:
   liquidation on a mark move, a withdrawn mark, and a dead connector.
 
