@@ -33,6 +33,8 @@ pub enum RiskError {
     InvalidMark { market: MarketId, mark: Decimal },
     #[error("no open position in {0}")]
     NoPosition(MarketId),
+    #[error("result is too small to represent")]
+    Underflow,
     #[error("arithmetic overflow")]
     Overflow,
 }

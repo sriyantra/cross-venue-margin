@@ -182,9 +182,10 @@ impl Engine {
 
     /// Fills a paper order at the market's current mark.
     ///
-    /// A fill that grows a position is refused if it would leave the account
-    /// in a margin call or worse. A fill that only reduces a position is
-    /// always accepted. A refused fill changes nothing.
+    /// A fill that leaves the position larger than it was is refused if it
+    /// would put the account in a margin call or worse. A fill that leaves
+    /// it the same size or smaller is always accepted, including one that
+    /// flips it to the other side. A refused fill changes nothing.
     pub fn fill(
         &mut self,
         id: AccountId,
@@ -215,7 +216,9 @@ impl Engine {
             (_, None) => false,
             (None, Some(_)) => true,
             (Some(before), Some(after)) => {
-                after.side() != before.side() || after.size() > before.size()
+                // A flip to a smaller position on the other side lowers
+                // the margin requirement, so it counts as a reduction.
+                after.size() > before.size()
             }
         };
         if grows {
@@ -499,6 +502,26 @@ mod tests {
             }
         );
         assert_eq!(engine.view(id).unwrap().collateral, dec!(2_000));
+    }
+
+    #[test]
+    fn flip_to_a_smaller_position_counts_as_a_reduction() {
+        let (mut engine, id) = long_btc();
+        engine.set_mark(market("BTC"), Some(dec!(58_000)), 10);
+        // Long 1 becomes short 0.9: smaller, so allowed in a margin call.
+        engine
+            .fill(id, market("BTC"), Side::Short, dec!(1.9), 11)
+            .unwrap();
+        let view = engine.view(id).unwrap();
+        assert_eq!(view.positions[0].side, Side::Short);
+        assert_eq!(view.positions[0].size, dec!(0.9));
+        // Long 1 to short 1.5 is larger, and equity cannot carry it.
+        let (mut engine, id) = long_btc();
+        engine.set_mark(market("BTC"), Some(dec!(58_000)), 10);
+        assert_eq!(
+            engine.fill(id, market("BTC"), Side::Short, dec!(2.5), 11),
+            Err(EngineError::InsufficientMargin)
+        );
     }
 
     #[test]

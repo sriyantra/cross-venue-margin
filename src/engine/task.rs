@@ -128,23 +128,26 @@ pub async fn run(
         })
         .collect();
 
-    loop {
-        let mut out = Vec::new();
-        tokio::select! {
+    'run: loop {
+        let command = tokio::select! {
             _ = shutdown.cancelled() => break,
             command = commands.recv() => match command {
-                Some(command) => out = handle(&mut engine, command, now_ms()),
+                Some(command) => Some(command),
                 None => break,
             },
-            _ = any_mark_changed(&mut marks) => {}
-        }
+            _ = any_mark_changed(&mut marks) => None,
+        };
+        let now = now_ms();
+        let mut out = Vec::new();
 
+        // Marks go first, so a command never runs against a mark the
+        // connector has already replaced or withdrawn.
+        //
         // `changed()` marks a value as seen when it resolves, so asking a
         // receiver afterwards whether it changed would miss the very update
         // that woke the task. Read every channel and compare with what the
         // engine already has. Each value is copied out, so no watch borrow
         // is alive at the await below.
-        let now = now_ms();
         marks.retain_mut(|watched| {
             // A closed channel means the connector is gone and this mark
             // will never update again.
@@ -165,9 +168,18 @@ pub async fn run(
             !closed
         });
 
+        if let Some(command) = command {
+            out.extend(handle(&mut engine, command, now));
+        }
+
+        // A full queue makes the engine wait here, which is the point: an
+        // event is never dropped. Shutdown must still get through.
         for event in out {
-            if events.send(event).await.is_err() {
-                return;
+            tokio::select! {
+                _ = shutdown.cancelled() => break 'run,
+                sent = events.send(event) => if sent.is_err() {
+                    break 'run;
+                },
             }
         }
     }

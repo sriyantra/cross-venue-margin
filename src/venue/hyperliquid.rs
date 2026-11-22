@@ -34,7 +34,7 @@ use crate::risk::TierTable;
 pub const VENUE: &str = "hyperliquid";
 
 /// How often to send an application-level ping.
-const PING_EVERY: Duration = Duration::from_secs(15);
+const PING_EVERY: Duration = Duration::from_secs(5);
 /// If no frame of any kind arrives for this long, treat the connection as
 /// dead even if the socket still looks open.
 const STALE_AFTER: Duration = Duration::from_secs(10);

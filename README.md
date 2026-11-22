@@ -48,6 +48,11 @@ Accounts are paper accounts. The service places no orders and holds no funds.
   Funding and fees are not modeled.
 - Liquidation closes every position at the mark in one step. Real venues
   liquidate in stages and at worse prices.
+- A mark that gaps past the liquidation price leaves the closed account
+  with negative collateral. There is no insurance fund or bad-debt handling.
+- While any of an account's markets has no current mark, its health is
+  unknown and its state is frozen. It is not liquidated on an old price,
+  even if its other positions are losing.
 
 ## Run
 

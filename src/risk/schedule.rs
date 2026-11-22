@@ -33,6 +33,8 @@ pub enum ScheduleError {
     RateOutOfRange(Decimal),
     #[error("deduction {0} must not be negative")]
     NegativeDeduction(Decimal),
+    #[error("the tier starting at {0} would require negative margin")]
+    NegativeMaintenance(Decimal),
     #[error("max leverage {0} must be at least 1")]
     LeverageTooLow(Decimal),
     #[error("max leverage must not rise as notional grows")]
@@ -67,6 +69,12 @@ impl TierTable {
             }
             if tier.deduction < Decimal::ZERO {
                 return Err(ScheduleError::NegativeDeduction(tier.deduction));
+            }
+            // Margin grows with notional inside a tier, so checking the
+            // tier's lower bound covers the whole tier.
+            let at_bound = mul(tier.lower_bound, tier.rate).map_err(|_| ScheduleError::Overflow)?;
+            if at_bound < tier.deduction {
+                return Err(ScheduleError::NegativeMaintenance(tier.lower_bound));
             }
         }
         Ok(Self { tiers })
@@ -222,6 +230,14 @@ mod tests {
         assert_eq!(
             TierTable::new(vec![tier(dec!(0), dec!(0.01)), tier(dec!(0), dec!(0.02))]),
             Err(ScheduleError::BoundsNotIncreasing)
+        );
+        assert_eq!(
+            TierTable::new(vec![Tier {
+                lower_bound: dec!(0),
+                rate: dec!(0.01),
+                deduction: dec!(100),
+            }]),
+            Err(ScheduleError::NegativeMaintenance(dec!(0)))
         );
         assert_eq!(
             TierTable::flat(dec!(1)),

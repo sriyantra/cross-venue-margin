@@ -32,19 +32,24 @@ struct Harness {
     mark: MarkTx,
     events: mpsc::Receiver<Event>,
     shutdown: CancellationToken,
+    task: tokio::task::JoinHandle<()>,
 }
 
 fn start() -> Harness {
+    start_with_event_queue(64)
+}
+
+fn start_with_event_queue(capacity: usize) -> Harness {
     let (feeds, mut publishers) = Feeds::channels(&["BTC".to_string()]);
     let mut schedule = Schedule::new();
     schedule.insert(btc(), TierTable::flat(dec!(0.0125)).unwrap());
     let engine = Engine::new(schedule, Thresholds::new(dec!(1.5)).unwrap());
 
     let (command_tx, command_rx) = mpsc::channel::<Command>(8);
-    let (event_tx, events) = mpsc::channel(64);
+    let (event_tx, events) = mpsc::channel(capacity);
     let shutdown = CancellationToken::new();
     let marks = vec![(btc(), feeds.subscribe_mark("BTC").unwrap())];
-    tokio::spawn(task::run(
+    let task = tokio::spawn(task::run(
         engine,
         marks,
         command_rx,
@@ -57,6 +62,7 @@ fn start() -> Harness {
         mark: publishers.remove("BTC").unwrap().mark,
         events,
         shutdown,
+        task,
     }
 }
 
@@ -208,4 +214,78 @@ async fn handle_reports_a_stopped_engine() {
     })
     .await;
     assert!(result.is_ok(), "engine never reported as stopped");
+}
+
+#[tokio::test]
+async fn command_never_runs_on_a_mark_that_was_replaced_or_withdrawn() {
+    let mut h = start();
+    publish(&h.mark, dec!(60_000));
+    let opened = h.long_one_btc(dec!(30_000)).await;
+
+    // Publish a new mark and send a fill straight after it, many times. The
+    // engine must price every fill at the mark published just before it.
+    let prices: Vec<Decimal> = (0..40).map(|i| dec!(60_000) + Decimal::from(i)).collect();
+    for px in &prices {
+        publish(&h.mark, *px);
+        h.engine
+            .fill(opened.id, btc(), Side::Long, dec!(0.001))
+            .await
+            .unwrap();
+    }
+    assert!(matches!(h.next_event().await, Event::AccountOpened { .. }));
+    assert!(matches!(h.next_event().await, Event::Filled { px, .. } if px == dec!(60_000)));
+    for want in prices {
+        match h.next_event().await {
+            Event::Filled { px, .. } => assert_eq!(px, want),
+            other => panic!("expected a fill, got {other:?}"),
+        }
+    }
+
+    h.mark.send_replace(None);
+    assert_eq!(
+        h.engine
+            .fill(opened.id, btc(), Side::Short, dec!(0.001))
+            .await,
+        Err(EngineError::NoMark(btc()))
+    );
+    h.shutdown.cancel();
+}
+
+#[tokio::test]
+async fn full_event_queue_slows_the_engine_and_loses_nothing() {
+    let mut h = start_with_event_queue(1);
+    let engine = h.engine.clone();
+    let creator = tokio::spawn(async move {
+        for _ in 0..6 {
+            engine.create_account(dec!(1)).await.unwrap();
+        }
+    });
+
+    let mut opened = Vec::new();
+    for _ in 0..6 {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        match h.next_event().await {
+            Event::AccountOpened { account, .. } => opened.push(account.0),
+            other => panic!("expected an account, got {other:?}"),
+        }
+    }
+    assert_eq!(opened, [1, 2, 3, 4, 5, 6]);
+    creator.await.unwrap();
+    assert!(h.events.try_recv().is_err(), "an event arrived twice");
+    h.shutdown.cancel();
+}
+
+#[tokio::test]
+async fn shutdown_gets_through_a_full_event_queue() {
+    let h = start_with_event_queue(1);
+    // Nothing reads events. The first one fills the queue and the second
+    // leaves the engine waiting for room.
+    h.engine.create_account(dec!(1)).await.unwrap();
+    h.engine.create_account(dec!(1)).await.unwrap();
+
+    h.shutdown.cancel();
+    tokio::time::timeout(WAIT, h.task)
+        .await
+        .expect("engine did not stop")
+        .unwrap();
 }

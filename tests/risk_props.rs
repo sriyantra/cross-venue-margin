@@ -57,14 +57,22 @@ fn position() -> impl Strategy<Value = Position> {
 }
 
 /// An account with one to three positions, and a mark for every coin.
+/// Collateral is 0% to 60% of the positions' cost, so accounts are
+/// leveraged and most positions have a real liquidation price.
 fn account_and_marks() -> impl Strategy<Value = (Account, Marks)> {
-    let collateral = (0i64..=100_000_000_000).prop_map(|cents| Decimal::new(cents, 2));
+    let collateral = 0i64..=6_000;
     let positions = proptest::collection::vec(proptest::option::of(position()), COINS.len())
         .prop_filter("at least one position", |slots| {
             slots.iter().any(Option::is_some)
         });
     let marks = proptest::collection::vec(price(), COINS.len());
-    (collateral, positions, marks).prop_map(|(collateral, positions, marks)| {
+    (collateral, positions, marks).prop_map(|(collateral_bps, positions, marks)| {
+        let cost: Decimal = positions
+            .iter()
+            .flatten()
+            .map(|position| position.size() * position.entry_px())
+            .sum();
+        let collateral = (cost * Decimal::new(collateral_bps, 4)).round_dp(2);
         let mut account = Account::new(collateral);
         for (coin, slot) in COINS.iter().zip(positions) {
             if let Some(position) = slot {

@@ -12,8 +12,10 @@ use super::{Account, MarketId, Marks, RiskError, Schedule, Side, Tier};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(tag = "type", content = "price", rename_all = "snake_case")]
 pub enum LiquidationPrice {
-    /// Margin available is zero at this price and negative beyond it: below
-    /// it for a long, above it for a short.
+    /// The account is safe at this price and liquidatable beyond it: below
+    /// it for a long, above it for a short. Margin available is zero here,
+    /// except where a table's requirement steps up at a tier bound, in which
+    /// case this is the bound and margin goes negative just past it.
     At(Decimal),
     /// No price of this market can make the account liquidatable. Only a
     /// long can be in this state, because its loss stops at a price of zero.
@@ -64,7 +66,9 @@ pub fn liquidation_price(
         Ok(LiquidationPrice::At(px))
     };
     // The price at which this position's notional reaches a tier's bound.
-    let bound_px = |tier: &Tier| div(tier.lower_bound, size);
+    // `None` means the position is too small to reach that bound at any
+    // price the decimal type can hold.
+    let bound_px = |tier: &Tier| tier.lower_bound.checked_div(size);
 
     match position.side() {
         // Margin rises with the price inside every tier. Walk down from the
@@ -73,11 +77,10 @@ pub fn liquidation_price(
             let mut i = tiers.len() - 1;
             loop {
                 let tier = &tiers[i];
-                if let Some(above) = tiers.get(i + 1) {
-                    let top = bound_px(above)?;
-                    if margin_at(tier, top)? < Decimal::ZERO {
-                        return Ok(LiquidationPrice::At(top));
-                    }
+                if let Some(top) = tiers.get(i + 1).and_then(bound_px)
+                    && margin_at(tier, top)? < Decimal::ZERO
+                {
+                    return Ok(LiquidationPrice::At(top));
                 }
                 if i == 0 {
                     return if margin_at(tier, Decimal::ZERO)? < Decimal::ZERO {
@@ -86,7 +89,9 @@ pub fn liquidation_price(
                         Ok(LiquidationPrice::Never)
                     };
                 }
-                if margin_at(tier, bound_px(tier)?)? < Decimal::ZERO {
+                if let Some(bottom) = bound_px(tier)
+                    && margin_at(tier, bottom)? < Decimal::ZERO
+                {
                     return root(tier);
                 }
                 i -= 1;
@@ -104,13 +109,15 @@ pub fn liquidation_price(
                 } else {
                     // The requirement can step up at a bound. If that step
                     // alone takes the margin negative, the bound is the price.
-                    let bottom = bound_px(tier)?;
+                    // This tier was only entered because its bound is a
+                    // reachable price.
+                    let bottom = bound_px(tier).ok_or(RiskError::Overflow)?;
                     if margin_at(tier, bottom)? < Decimal::ZERO {
                         return Ok(LiquidationPrice::At(bottom));
                     }
                 }
-                match tiers.get(i + 1) {
-                    Some(above) if margin_at(tier, bound_px(above)?)? >= Decimal::ZERO => i += 1,
+                match tiers.get(i + 1).and_then(bound_px) {
+                    Some(top) if margin_at(tier, top)? >= Decimal::ZERO => i += 1,
                     _ => return root(tier),
                 }
             }
@@ -258,6 +265,23 @@ mod tests {
         assert_eq!(price(&account, &Marks::new(), &schedule), dec!(10_000));
         assert_eq!(margin_at(&account, dec!(10_000), &schedule), dec!(1_000));
         assert!(margin_at(&account, dec!(10_000.01), &schedule) < dec!(0));
+    }
+
+    #[test]
+    fn dust_position_cannot_reach_the_upper_tier() {
+        // 150M of notional is past the largest decimal for a position this
+        // small, so only the first tier can apply.
+        let dust = Decimal::new(1, 22);
+        let funded = one_position(dec!(1), Side::Long, dust, dec!(60_000));
+        assert_eq!(
+            liquidation_price(&funded, &market("BTC"), &Marks::new(), &schedule()),
+            Ok(LiquidationPrice::Never)
+        );
+        let short = one_position(dec!(0.000000000000000001), Side::Short, dust, dec!(60_000));
+        assert!(matches!(
+            liquidation_price(&short, &market("BTC"), &Marks::new(), &schedule()),
+            Ok(LiquidationPrice::At(_))
+        ));
     }
 
     #[test]

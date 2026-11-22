@@ -182,10 +182,16 @@ impl Account {
                 mul(held.size, held.entry_px)?,
                 mul(fill.size, fill.entry_px)?,
             )?;
+            let entry_px = div(cost, size)?;
+            // Sizes near the limit of the decimal type can round the cost
+            // to zero. A position with no entry price must not exist.
+            if entry_px <= Decimal::ZERO {
+                return Err(RiskError::Underflow);
+            }
             let grown = Position {
                 side: held.side,
                 size,
-                entry_px: div(cost, size)?,
+                entry_px,
             };
             self.positions.insert(market, grown);
             return Ok(Decimal::ZERO);
@@ -308,6 +314,21 @@ mod tests {
             Some(&pos(Side::Long, dec!(4), dec!(115)))
         );
         assert_eq!(account.collateral, dec!(1_000));
+    }
+
+    #[test]
+    fn fill_too_small_to_price_is_an_error() {
+        let dust = Decimal::new(1, 28);
+        let mut account = Account::new(dec!(1_000));
+        account
+            .apply_fill(btc(), pos(Side::Long, dust, dec!(0.5)))
+            .unwrap();
+        let untouched = account.clone();
+        assert_eq!(
+            account.apply_fill(btc(), pos(Side::Long, dust, dec!(0.5))),
+            Err(RiskError::Underflow)
+        );
+        assert_eq!(account, untouched);
     }
 
     #[test]
