@@ -6,5 +6,6 @@
 pub mod book;
 pub mod config;
 pub mod feed;
+pub mod risk;
 pub mod server;
 pub mod venue;
