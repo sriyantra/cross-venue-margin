@@ -4,7 +4,8 @@ A Rust service that keeps live order books from more than one trading venue and
 computes margin for accounts whose positions span those venues on a single
 collateral balance.
 
-Status: stage 3 of 4 is done. Two venues are connected, Hyperliquid and
+Status: stages 1 to 3 are done, and stage 4 has its Docker image and
+metrics but no public deployment yet. Two venues are connected, Hyperliquid and
 OKX, with live books and mark prices from both. A paper account can hold
 positions on both venues against one collateral balance, each margined by
 its own venue's rules and marked at its own venue's price. Every account
@@ -86,6 +87,15 @@ Accounts are paper accounts. The service places no orders and holds no funds.
 ```sh
 cargo run --release
 ```
+
+Or with Docker, which also starts Postgres for the event log:
+
+```sh
+docker compose up --build
+```
+
+The image is a static release build on a distroless base, about 49 MB,
+running as a non-root user.
 
 Environment:
 
@@ -219,4 +229,5 @@ cargo test
    explicit account state machine. Done.
 3. Second venue, an append-only event log in Postgres, and rebuilding
    state from that log. Done.
-4. Docker image, metrics for feed-to-decision latency, deployment.
+4. Docker image, metrics for feed-to-decision latency, deployment. The
+   image and metrics are done. Deployment is not.
