@@ -9,11 +9,13 @@ use rust_decimal::Decimal;
 use thiserror::Error;
 
 pub mod health;
+pub mod liquidation;
 mod num;
 pub mod schedule;
 pub mod types;
 
 pub use health::{Health, account_health};
+pub use liquidation::{LiquidationPrice, liquidation_price};
 pub use schedule::{Schedule, ScheduleError, Tier, TierTable};
 pub use types::{Account, MarketId, Marks, Position, PositionError, Side, Venue};
 
@@ -27,6 +29,8 @@ pub enum RiskError {
     MissingSchedule(MarketId),
     #[error("mark price {mark} for {market} is not positive")]
     InvalidMark { market: MarketId, mark: Decimal },
+    #[error("no open position in {0}")]
+    NoPosition(MarketId),
     #[error("arithmetic overflow")]
     Overflow,
 }

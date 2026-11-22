@@ -1,0 +1,166 @@
+//! Property tests for the risk core. Each test states a rule that must hold
+//! for every account, and proptest searches for an account that breaks it.
+
+use cross_venue_margin::risk::{
+    Account, LiquidationPrice, MarketId, Marks, Position, Schedule, Side, TierTable, Venue,
+    account_health, liquidation_price,
+};
+use proptest::prelude::*;
+use rust_decimal::{Decimal, dec};
+
+const COINS: [&str; 3] = ["BTC", "ETH", "SOL"];
+const TOLERANCE: Decimal = dec!(0.000001);
+
+fn market(coin: &str) -> MarketId {
+    MarketId::new(Venue::Hyperliquid, coin)
+}
+
+/// Tables whose bounds sit inside the notionals the generators produce, so
+/// positions land in every tier. Max leverage of 15 gives a rate that does
+/// not terminate in decimal.
+fn schedule() -> Schedule {
+    let table = |brackets: &[(Decimal, Decimal)]| TierTable::from_max_leverage(brackets).unwrap();
+    let mut schedule = Schedule::new();
+    schedule.insert(
+        market("BTC"),
+        table(&[
+            (dec!(0), dec!(40)),
+            (dec!(50_000), dec!(20)),
+            (dec!(500_000), dec!(10)),
+        ]),
+    );
+    schedule.insert(
+        market("ETH"),
+        table(&[(dec!(0), dec!(25)), (dec!(100_000), dec!(15))]),
+    );
+    schedule.insert(market("SOL"), table(&[(dec!(0), dec!(20))]));
+    schedule
+}
+
+/// 0.01 to 100,000.00
+fn price() -> impl Strategy<Value = Decimal> {
+    (1i64..=10_000_000).prop_map(|cents| Decimal::new(cents, 2))
+}
+
+/// 0.0001 to 100.0000
+fn size() -> impl Strategy<Value = Decimal> {
+    (1i64..=1_000_000).prop_map(|units| Decimal::new(units, 4))
+}
+
+fn side() -> impl Strategy<Value = Side> {
+    prop_oneof![Just(Side::Long), Just(Side::Short)]
+}
+
+fn position() -> impl Strategy<Value = Position> {
+    (side(), size(), price())
+        .prop_map(|(side, size, entry)| Position::new(side, size, entry).unwrap())
+}
+
+/// An account with one to three positions, and a mark for every coin.
+fn account_and_marks() -> impl Strategy<Value = (Account, Marks)> {
+    let collateral = (0i64..=100_000_000_000).prop_map(|cents| Decimal::new(cents, 2));
+    let positions = proptest::collection::vec(proptest::option::of(position()), COINS.len())
+        .prop_filter("at least one position", |slots| {
+            slots.iter().any(Option::is_some)
+        });
+    let marks = proptest::collection::vec(price(), COINS.len());
+    (collateral, positions, marks).prop_map(|(collateral, positions, marks)| {
+        let mut account = Account::new(collateral);
+        for (coin, slot) in COINS.iter().zip(positions) {
+            if let Some(position) = slot {
+                account.set_position(market(coin), position);
+            }
+        }
+        let marks = COINS.iter().map(|coin| market(coin)).zip(marks).collect();
+        (account, marks)
+    })
+}
+
+fn margin_with(account: &Account, marks: &Marks, target: &MarketId, px: Decimal) -> Decimal {
+    let mut moved = marks.clone();
+    moved.insert(target.clone(), px);
+    account_health(account, &moved, &schedule())
+        .unwrap()
+        .margin_available
+}
+
+proptest! {
+    /// Gross margin: the account's numbers are the sums of its positions'
+    /// numbers taken one at a time.
+    #[test]
+    fn health_is_additive_over_positions((account, marks) in account_and_marks()) {
+        let schedule = schedule();
+        let whole = account_health(&account, &marks, &schedule).unwrap();
+
+        let (mut pnl, mut maintenance, mut notional) = (dec!(0), dec!(0), dec!(0));
+        for (market, position) in account.positions() {
+            let mut single = Account::new(dec!(0));
+            single.set_position(market.clone(), *position);
+            let part = account_health(&single, &marks, &schedule).unwrap();
+            pnl += part.unrealized_pnl;
+            maintenance += part.maintenance_required;
+            notional += part.notional;
+        }
+
+        prop_assert_eq!(whole.unrealized_pnl, pnl);
+        prop_assert_eq!(whole.maintenance_required, maintenance);
+        prop_assert_eq!(whole.notional, notional);
+        prop_assert_eq!(whole.equity, account.collateral + pnl);
+        prop_assert_eq!(whole.margin_available, whole.equity - maintenance);
+        prop_assert_eq!(whole.is_liquidatable(), whole.equity < maintenance);
+    }
+
+    /// The liquidation price is the price where margin available is zero,
+    /// and the account is safe on one side of it and liquidatable on the other.
+    #[test]
+    fn liquidation_price_is_where_margin_runs_out((account, marks) in account_and_marks()) {
+        let schedule = schedule();
+        let tiny = dec!(0.00000001);
+
+        for (target, position) in account.positions() {
+            match liquidation_price(&account, target, &marks, &schedule).unwrap() {
+                LiquidationPrice::At(px) => {
+                    prop_assert!(px > dec!(0));
+                    let at = margin_with(&account, &marks, target, px);
+                    prop_assert!(at.abs() < TOLERANCE, "margin at {px} is {at}");
+
+                    // Far enough from zero for a 1% move to outweigh rounding.
+                    if px >= dec!(0.01) {
+                        let above = margin_with(&account, &marks, target, px * dec!(1.01));
+                        let below = margin_with(&account, &marks, target, px * dec!(0.99));
+                        match position.side() {
+                            Side::Long => prop_assert!(above > dec!(0) && below < dec!(0)),
+                            Side::Short => prop_assert!(above < dec!(0) && below > dec!(0)),
+                        }
+                    }
+                }
+                LiquidationPrice::Never => {
+                    prop_assert_eq!(position.side(), Side::Long);
+                    prop_assert!(margin_with(&account, &marks, target, tiny) >= dec!(0));
+                }
+                LiquidationPrice::AtAnyPrice => {
+                    prop_assert_eq!(position.side(), Side::Short);
+                    prop_assert!(margin_with(&account, &marks, target, tiny) < dec!(0));
+                }
+            }
+        }
+    }
+
+    /// A bigger position never needs less maintenance margin, and the
+    /// requirement does not jump when a position crosses into the next tier.
+    #[test]
+    fn maintenance_grows_smoothly_with_notional(
+        a in 0i64..=200_000_000,
+        b in 0i64..=200_000_000,
+    ) {
+        let schedule = schedule();
+        let (low, high) = (Decimal::new(a.min(b), 2), Decimal::new(a.max(b), 2));
+        for coin in COINS {
+            let table = schedule.table(&market(coin)).unwrap();
+            let (m_low, m_high) = (table.maintenance(low).unwrap(), table.maintenance(high).unwrap());
+            prop_assert!(m_low <= m_high);
+            // No rate here is above 5%, so no step can exceed 5% of the gap.
+            prop_assert!(m_high - m_low <= (high - low) * dec!(0.05) + TOLERANCE);
+        }
+    }
+}
