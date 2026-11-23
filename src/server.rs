@@ -133,16 +133,26 @@ struct Health {
     markets: Vec<MarketHealth>,
 }
 
-pub fn router(feeds: Feeds, engine: EngineHandle, metrics: Metrics) -> Router {
+/// With `read_only` set, the two routes that change an account answer 403
+/// and never reach the engine.
+pub fn router(feeds: Feeds, engine: EngineHandle, metrics: Metrics, read_only: bool) -> Router {
+    let writes = if read_only {
+        Router::new()
+            .route("/accounts", post(refuse_write))
+            .route("/accounts/{id}/fills", post(refuse_write))
+    } else {
+        Router::new()
+            .route("/accounts", post(create_account))
+            .route("/accounts/{id}/fills", post(fill))
+    };
     Router::new()
         .route("/health", get(health))
         .route("/book/{venue}/{coin}", get(book))
         .route("/mark/{venue}/{coin}", get(mark))
         .route("/ws/{venue}/{coin}", get(ws_upgrade))
-        .route("/accounts", post(create_account))
         .route("/accounts/{id}", get(account))
-        .route("/accounts/{id}/fills", post(fill))
         .route("/metrics", get(render_metrics))
+        .merge(writes)
         .with_state(AppState {
             feeds: Arc::new(feeds),
             engine,
@@ -156,11 +166,12 @@ pub async fn serve(
     feeds: Feeds,
     engine: EngineHandle,
     metrics: Metrics,
+    read_only: bool,
     shutdown: CancellationToken,
 ) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(bind).await?;
-    info!(addr = %listener.local_addr()?, "api listening");
-    axum::serve(listener, router(feeds, engine, metrics))
+    info!(addr = %listener.local_addr()?, read_only, "api listening");
+    axum::serve(listener, router(feeds, engine, metrics, read_only))
         .with_graceful_shutdown(async move { shutdown.cancelled().await })
         .await?;
     Ok(())
@@ -254,6 +265,13 @@ fn engine_error(error: EngineError) -> Response {
         error: error.to_string(),
     };
     (status, Json(body)).into_response()
+}
+
+async fn refuse_write() -> Response {
+    let body = ErrorBody {
+        error: "this deployment is read-only".into(),
+    };
+    (StatusCode::FORBIDDEN, Json(body)).into_response()
 }
 
 async fn create_account(

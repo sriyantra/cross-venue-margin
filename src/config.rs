@@ -37,6 +37,9 @@ pub struct Config {
     /// Postgres URL for the event log. Without it events are only logged,
     /// and accounts do not survive a restart.
     pub database_url: Option<Secret>,
+    /// When set, the API refuses every request that would change an
+    /// account. Used for a deployment that is open to the public.
+    pub read_only: bool,
 }
 
 impl Config {
@@ -72,6 +75,15 @@ impl Config {
             .filter(|url| !url.is_empty())
             .map(Secret);
 
+        let read_only = match std::env::var("READ_ONLY") {
+            Err(_) => false,
+            Ok(value) => match value.as_str() {
+                "" | "0" | "false" => false,
+                "1" | "true" => true,
+                _ => bail!("READ_ONLY must be true or false"),
+            },
+        };
+
         Ok(Self {
             hl_ws_url,
             okx_ws_url,
@@ -79,6 +91,7 @@ impl Config {
             bind,
             margin_call_multiple,
             database_url,
+            read_only,
         })
     }
 }

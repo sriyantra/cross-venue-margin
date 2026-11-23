@@ -144,6 +144,7 @@ async fn main() -> Result<()> {
         feeds,
         EngineHandle::new(command_tx),
         metrics,
+        config.read_only,
         shutdown.clone(),
     ));
 

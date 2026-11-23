@@ -4,8 +4,8 @@ A Rust service that keeps live order books from more than one trading venue and
 computes margin for accounts whose positions span those venues on a single
 collateral balance.
 
-Status: stages 1 to 3 are done, and stage 4 has its Docker image and
-metrics but no public deployment yet. Two venues are connected, Hyperliquid and
+Status: all four roadmap stages are done, and a read-only instance is
+running (see Live instance). Two venues are connected, Hyperliquid and
 OKX, with live books and mark prices from both. A paper account can hold
 positions on both venues against one collateral balance, each margined by
 its own venue's rules and marked at its own venue's price. Every account
@@ -82,6 +82,20 @@ Accounts are paper accounts. The service places no orders and holds no funds.
   unknown and its state is frozen. It is not liquidated on an old price,
   even if its other positions are losing.
 
+## Live instance
+
+A deployment of this repository's Docker image, with Postgres for the
+event log. It is read-only: the two `POST` routes answer 403. Account 1 is
+a paper account that is long BTC on one venue and short the same size on
+the other, against one balance.
+
+```sh
+curl -s https://margin-production-1f4db33a.up.railway.app/health
+curl -s https://margin-production-1f4db33a.up.railway.app/accounts/1
+curl -s https://margin-production-1f4db33a.up.railway.app/book/okx/BTC
+curl -s https://margin-production-1f4db33a.up.railway.app/metrics
+```
+
 ## Run
 
 ```sh
@@ -107,6 +121,7 @@ Environment:
 | `BIND`      | `127.0.0.1:8080`               | API listen address         |
 | `DATABASE_URL` | unset                       | Postgres URL for the event log. Without it events are only logged and accounts are lost on restart |
 | `MARGIN_CALL_MULTIPLE` | `1.5`               | Margin call starts when equity is below maintenance margin times this |
+| `READ_ONLY` | `false`                        | When `true`, the routes that change an account answer 403 |
 | `RUST_LOG`  | `info`                         | Log filter                 |
 
 ## API
@@ -219,6 +234,8 @@ cargo test
   updates and deletes. It needs `TEST_DATABASE_URL` and reports a skip
   without it:
   `TEST_DATABASE_URL=postgres://postgres@127.0.0.1:5432/postgres cargo test`
+- `tests/server.rs` runs the API on a local port and checks that a
+  read-only instance refuses writes before they reach the engine.
 - `tests/engine.rs` runs the engine task against hand-driven mark channels:
   liquidation on a mark move, a withdrawn mark, and a dead connector.
 
@@ -229,5 +246,4 @@ cargo test
    explicit account state machine. Done.
 3. Second venue, an append-only event log in Postgres, and rebuilding
    state from that log. Done.
-4. Docker image, metrics for feed-to-decision latency, deployment. The
-   image and metrics are done. Deployment is not.
+4. Docker image, metrics for feed-to-decision latency, deployment. Done.
