@@ -25,6 +25,12 @@ pub enum Command {
         collateral: Decimal,
         reply: Reply<Result<AccountView, EngineError>>,
     },
+    Deposit {
+        account: AccountId,
+        asset: String,
+        amount: Decimal,
+        reply: Reply<Result<AccountView, EngineError>>,
+    },
     Fill {
         account: AccountId,
         market: MarketId,
@@ -64,6 +70,21 @@ impl EngineHandle {
     pub async fn create_account(&self, collateral: Decimal) -> Result<AccountView, EngineError> {
         self.request(|reply| Command::CreateAccount { collateral, reply })
             .await?
+    }
+
+    pub async fn deposit(
+        &self,
+        account: AccountId,
+        asset: String,
+        amount: Decimal,
+    ) -> Result<AccountView, EngineError> {
+        self.request(|reply| Command::Deposit {
+            account,
+            asset,
+            amount,
+            reply,
+        })
+        .await?
     }
 
     pub async fn fill(
@@ -201,6 +222,24 @@ fn handle(engine: &mut Engine, command: Command, now: u64) -> Vec<Event> {
             let (result, events) = match engine.create_account(collateral, now) {
                 Ok((id, events)) => (
                     engine.view(id).ok_or(EngineError::UnknownAccount(id)),
+                    events,
+                ),
+                Err(error) => (Err(error), Vec::new()),
+            };
+            let _ = reply.send(result);
+            events
+        }
+        Command::Deposit {
+            account,
+            asset,
+            amount,
+            reply,
+        } => {
+            let (result, events) = match engine.deposit(account, &asset, amount, now) {
+                Ok(events) => (
+                    engine
+                        .view(account)
+                        .ok_or(EngineError::UnknownAccount(account)),
                     events,
                 ),
                 Err(error) => (Err(error), Vec::new()),

@@ -115,6 +115,7 @@ mod tests {
     fn health(equity: Decimal, maintenance_required: Decimal) -> Health {
         Health {
             equity,
+            collateral_value: dec!(0),
             unrealized_pnl: dec!(0),
             notional: dec!(0),
             maintenance_required,

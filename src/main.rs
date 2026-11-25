@@ -1,10 +1,12 @@
 use anyhow::Result;
-use cross_venue_margin::config::Config;
+use cross_venue_margin::config::{self, Config};
 use cross_venue_margin::engine::task::{self, EngineHandle};
 use cross_venue_margin::engine::{Engine, Event};
 use cross_venue_margin::feed::Feeds;
 use cross_venue_margin::metrics::Metrics;
-use cross_venue_margin::risk::{MarginTable, MarketId, Schedule, Thresholds, Venue};
+use cross_venue_margin::risk::{
+    CollateralRule, MarginTable, MarketId, Schedule, Thresholds, Venue,
+};
 use cross_venue_margin::store::{self, EventStore};
 use cross_venue_margin::{server, venue};
 use tokio::sync::mpsc;
@@ -84,6 +86,13 @@ async fn main() -> Result<()> {
                 schedule.insert(market.clone(), table);
             }
             None => warn!(%market, "no maintenance table, positions will be refused"),
+        }
+    }
+    // A coin held as collateral is valued at its Hyperliquid mark.
+    for coin in &config.coins {
+        if let Some(haircut) = config::collateral_haircut(coin) {
+            let price = MarketId::new(Venue::Hyperliquid, coin.as_str());
+            schedule.insert_collateral(coin.as_str(), CollateralRule::new(price, haircut)?);
         }
     }
     let thresholds = Thresholds::new(config.margin_call_multiple)?;

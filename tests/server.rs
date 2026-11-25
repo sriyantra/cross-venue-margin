@@ -63,6 +63,11 @@ async fn read_only_refuses_writes_before_the_engine() {
     );
     let fill = r#"{"venue":"hyperliquid","coin":"BTC","side":"long","size":"1"}"#;
     assert_eq!(status(addr, "POST", "/accounts/1/fills", fill).await, 403);
+    let deposit = r#"{"asset":"BTC","amount":"1"}"#;
+    assert_eq!(
+        status(addr, "POST", "/accounts/1/deposits", deposit).await,
+        403
+    );
 
     assert!(
         commands.try_recv().is_err(),

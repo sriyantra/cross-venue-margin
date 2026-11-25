@@ -95,3 +95,13 @@ impl Config {
         })
     }
 }
+
+/// The haircut on a coin held as collateral, or `None` if the coin is not
+/// accepted. These are this service's own numbers, not a venue's.
+pub fn collateral_haircut(coin: &str) -> Option<Decimal> {
+    match coin {
+        "BTC" => Some(Decimal::new(10, 2)),
+        "ETH" => Some(Decimal::new(15, 2)),
+        _ => None,
+    }
+}

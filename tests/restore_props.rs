@@ -5,7 +5,9 @@
 use std::collections::BTreeMap;
 
 use cross_venue_margin::engine::{AccountId, Engine, Event};
-use cross_venue_margin::risk::{MarketId, Schedule, Side, SizeTable, Thresholds, TierTable, Venue};
+use cross_venue_margin::risk::{
+    CollateralRule, MarketId, Schedule, Side, SizeTable, Thresholds, TierTable, Venue,
+};
 use proptest::prelude::*;
 use rust_decimal::{Decimal, dec};
 
@@ -27,12 +29,20 @@ fn parts() -> (Schedule, Thresholds) {
         okx,
         SizeTable::new(&[(dec!(10), dec!(0.004)), (dec!(10_000), dec!(0.01))]).unwrap(),
     );
+    let [hl, _] = markets();
+    schedule.insert_collateral("BTC", CollateralRule::new(hl, dec!(0.10)).unwrap());
     (schedule, Thresholds::new(dec!(1.5)).unwrap())
 }
 
 #[derive(Debug, Clone)]
 enum Op {
     Open(Decimal),
+    /// Dollars when `coin` is false, BTC when it is true.
+    Deposit {
+        account: usize,
+        coin: bool,
+        amount: Decimal,
+    },
     Fill {
         account: usize,
         market: usize,
@@ -49,6 +59,9 @@ fn op() -> impl Strategy<Value = Op> {
     let side = prop_oneof![Just(Side::Long), Just(Side::Short)];
     prop_oneof![
         1 => (0i64..=200_000).prop_map(|cents| Op::Open(Decimal::new(cents, 2))),
+        1 => (0usize..4, any::<bool>(), 0i64..=100_000).prop_map(|(account, coin, units)| {
+            Op::Deposit { account, coin, amount: Decimal::new(units, 4) }
+        }),
         4 => (0usize..4, 0usize..2, side, 1i64..=300_000).prop_map(
             |(account, market, side, units)| Op::Fill {
                 account,
@@ -89,6 +102,20 @@ fn run(ops: &[Op]) -> Run {
                 let (id, events) = run.engine.create_account(*collateral, now).unwrap();
                 run.accounts.push(id);
                 run.events.extend(events);
+            }
+            Op::Deposit {
+                account,
+                coin,
+                amount,
+            } => {
+                let Some(id) = run.accounts.get(*account) else {
+                    continue;
+                };
+                let asset = if *coin { "BTC" } else { "USDC" };
+                // A refused deposit emits nothing and changes nothing.
+                if let Ok(events) = run.engine.deposit(*id, asset, *amount, now) {
+                    run.events.extend(events);
+                }
             }
             Op::Fill {
                 account,

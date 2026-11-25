@@ -3,14 +3,18 @@
 use rust_decimal::Decimal;
 use serde::Serialize;
 
-use super::num::{add, sub};
+use super::num::{add, mul, sub};
 use super::{Account, MarketId, Marks, RiskError, Schedule};
 
 /// An account's risk numbers at one set of mark prices.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct Health {
-    /// Collateral plus unrealized profit and loss.
+    /// Dollar balance, plus the haircut value of coins held as collateral,
+    /// plus unrealized profit and loss.
     pub equity: Decimal,
+    /// What the coins held as collateral count for: each one's amount times
+    /// its mark, less its haircut.
+    pub collateral_value: Decimal,
     pub unrealized_pnl: Decimal,
     /// Sum of position values. Long and short both count as positive.
     pub notional: Decimal,
@@ -42,11 +46,23 @@ pub(crate) fn mark_for(marks: &Marks, market: &MarketId) -> Result<Decimal, Risk
     Ok(mark)
 }
 
+/// What `amount` of a collateral asset counts for at the current marks.
+pub fn asset_value(
+    asset: &str,
+    amount: Decimal,
+    marks: &Marks,
+    schedule: &Schedule,
+) -> Result<Decimal, RiskError> {
+    let rule = schedule.collateral(asset)?;
+    let mark = mark_for(marks, rule.price())?;
+    mul(mul(amount, mark)?, rule.weight())
+}
+
 /// Computes account health.
 ///
-/// Fails if any open position has no mark or no schedule. A number built
-/// from a partial set of prices would be wrong, so there is no partial
-/// result.
+/// Fails if any open position has no mark or no schedule, or any
+/// collateral asset has no mark or no rule. A number built from a partial
+/// set of prices would be wrong, so there is no partial result.
 pub fn account_health(
     account: &Account,
     marks: &Marks,
@@ -68,9 +84,18 @@ pub fn account_health(
         maintenance_required = add(maintenance_required, maintenance)?;
     }
 
-    let equity = add(account.collateral, unrealized_pnl)?;
+    let mut collateral_value = Decimal::ZERO;
+    for (asset, amount) in account.assets() {
+        collateral_value = add(
+            collateral_value,
+            asset_value(asset, amount, marks, schedule)?,
+        )?;
+    }
+
+    let equity = add(add(account.collateral, collateral_value)?, unrealized_pnl)?;
     Ok(Health {
         equity,
+        collateral_value,
         unrealized_pnl,
         notional,
         maintenance_required,

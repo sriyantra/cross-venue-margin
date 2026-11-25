@@ -15,8 +15,9 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::risk::{
-    Account, AccountState, Health, LiquidationPrice, MarketId, Marks, Position, PositionError,
-    RiskError, Schedule, Side, Thresholds, account_health, liquidation_price, step,
+    Account, AccountState, CASH_ASSET, Health, LiquidationPrice, MarketId, Marks, Position,
+    PositionError, RiskError, Schedule, Side, Thresholds, account_health, asset_value,
+    liquidation_price, step,
 };
 
 pub mod restore;
@@ -42,6 +43,13 @@ pub enum Event {
     AccountOpened {
         account: AccountId,
         collateral: Decimal,
+        at: u64,
+    },
+    /// Collateral added to an account: dollars, or a coin kept in kind.
+    CollateralDeposited {
+        account: AccountId,
+        asset: String,
+        amount: Decimal,
         at: u64,
     },
     Filled {
@@ -83,6 +91,7 @@ impl Event {
     pub fn account(&self) -> AccountId {
         match self {
             Event::AccountOpened { account, .. }
+            | Event::CollateralDeposited { account, .. }
             | Event::Filled { account, .. }
             | Event::StateChanged { account, .. }
             | Event::Liquidated { account, .. }
@@ -94,6 +103,7 @@ impl Event {
     pub fn at(&self) -> u64 {
         match self {
             Event::AccountOpened { at, .. }
+            | Event::CollateralDeposited { at, .. }
             | Event::Filled { at, .. }
             | Event::StateChanged { at, .. }
             | Event::Liquidated { at, .. }
@@ -105,6 +115,7 @@ impl Event {
     pub fn kind(&self) -> &'static str {
         match self {
             Event::AccountOpened { .. } => "account_opened",
+            Event::CollateralDeposited { .. } => "collateral_deposited",
             Event::Filled { .. } => "filled",
             Event::StateChanged { .. } => "state_changed",
             Event::Liquidated { .. } => "liquidated",
@@ -121,6 +132,10 @@ pub enum EngineError {
     AccountClosed(AccountId),
     #[error("collateral {0} must not be negative")]
     NegativeCollateral(Decimal),
+    #[error("deposit amount {0} must be above zero")]
+    NonPositiveDeposit(Decimal),
+    #[error("{0} is not accepted as collateral")]
+    UnsupportedAsset(String),
     #[error("{0} has no maintenance schedule")]
     UnsupportedMarket(MarketId),
     #[error("no current mark for {0}")]
@@ -142,6 +157,7 @@ impl From<RiskError> for EngineError {
         match error {
             RiskError::MissingMark(market) => EngineError::NoMark(market),
             RiskError::MissingSchedule(market) => EngineError::UnsupportedMarket(market),
+            RiskError::UnsupportedAsset(asset) => EngineError::UnsupportedAsset(asset),
             RiskError::AboveSchedule { size, max } => EngineError::PositionTooLarge { size, max },
             other => EngineError::Risk(other),
         }
@@ -154,10 +170,26 @@ pub struct AccountView {
     pub id: AccountId,
     #[serde(flatten)]
     pub state: AccountState,
+    /// The dollar balance.
     pub collateral: Decimal,
-    /// `None` while any open position has no current mark.
+    /// Coins held as collateral.
+    pub assets: Vec<AssetView>,
+    /// `None` while any open position or collateral asset has no current
+    /// mark.
     pub health: Option<Health>,
     pub positions: Vec<PositionView>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AssetView {
+    pub asset: String,
+    pub amount: Decimal,
+    /// The share of the asset's value that does not count.
+    pub haircut: Option<Decimal>,
+    pub mark: Option<Decimal>,
+    /// What the asset counts for in equity: amount times mark, less the
+    /// haircut.
+    pub value: Option<Decimal>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -219,6 +251,49 @@ impl Engine {
             at: now,
         };
         Ok((id, vec![opened]))
+    }
+
+    /// Adds collateral to an account. `asset` is the dollar asset or a coin
+    /// the schedule accepts. A coin is kept in kind and valued at its mark
+    /// from then on.
+    pub fn deposit(
+        &mut self,
+        id: AccountId,
+        asset: &str,
+        amount: Decimal,
+        now: u64,
+    ) -> Result<Vec<Event>, EngineError> {
+        let entry = self
+            .accounts
+            .get_mut(&id)
+            .ok_or(EngineError::UnknownAccount(id))?;
+        if matches!(entry.state, AccountState::Closed { .. }) {
+            return Err(EngineError::AccountClosed(id));
+        }
+        if amount <= Decimal::ZERO {
+            return Err(EngineError::NonPositiveDeposit(amount));
+        }
+        if asset != CASH_ASSET {
+            self.schedule.collateral(asset)?;
+        }
+        entry.account.deposit(asset, amount)?;
+
+        let mut events = vec![Event::CollateralDeposited {
+            account: id,
+            asset: asset.to_string(),
+            amount,
+            at: now,
+        }];
+        reassess(
+            id,
+            entry,
+            &self.marks,
+            &self.schedule,
+            &self.thresholds,
+            now,
+            &mut events,
+        );
+        Ok(events)
     }
 
     /// Fills a paper order at the market's current mark.
@@ -292,7 +367,8 @@ impl Engine {
     }
 
     /// Records a new mark for a market, or its loss when `mark` is `None`,
-    /// and re-evaluates every account that holds a position there.
+    /// and re-evaluates every account that holds a position there or holds
+    /// collateral priced by it.
     pub fn set_mark(&mut self, market: MarketId, mark: Option<Decimal>, now: u64) -> Vec<Event> {
         match mark {
             Some(px) => self.marks.insert(market.clone(), px),
@@ -301,7 +377,12 @@ impl Engine {
 
         let mut events = Vec::new();
         for (id, entry) in &mut self.accounts {
-            if entry.account.position(&market).is_some() {
+            let priced_here = entry.account.assets().any(|(asset, _)| {
+                self.schedule
+                    .collateral(asset)
+                    .is_ok_and(|rule| rule.price() == &market)
+            });
+            if priced_here || entry.account.position(&market).is_some() {
                 reassess(
                     *id,
                     entry,
@@ -340,10 +421,24 @@ impl Engine {
                 }
             })
             .collect();
+        let assets = account
+            .assets()
+            .map(|(asset, amount)| {
+                let rule = self.schedule.collateral(asset).ok();
+                AssetView {
+                    asset: asset.to_string(),
+                    amount,
+                    haircut: rule.map(|rule| rule.haircut()),
+                    mark: rule.and_then(|rule| self.marks.get(rule.price()).copied()),
+                    value: asset_value(asset, amount, &self.marks, &self.schedule).ok(),
+                }
+            })
+            .collect();
         Some(AccountView {
             id,
             state: entry.state,
             collateral: account.collateral,
+            assets,
             health: account_health(account, &self.marks, &self.schedule).ok(),
             positions,
         })
@@ -493,6 +588,203 @@ mod tests {
         let view = engine.view(id).unwrap();
         assert!(matches!(view.state, AccountState::Closed { .. }));
         assert_eq!(view.collateral, dec!(8_000));
+    }
+
+    /// The two-venue engine, accepting BTC as collateral at a 10% haircut
+    /// and pricing it at the Hyperliquid mark.
+    fn coin_engine() -> Engine {
+        let mut engine = two_venue_engine();
+        engine.schedule.insert_collateral(
+            "BTC",
+            crate::risk::CollateralRule::new(market("BTC"), dec!(0.10)).unwrap(),
+        );
+        engine
+    }
+
+    #[test]
+    fn coin_collateral_backs_positions_on_both_venues() {
+        let mut engine = coin_engine();
+        let (id, _) = engine.create_account(dec!(0), 1).unwrap();
+        // No dollars, so no fill is possible yet.
+        assert_eq!(
+            engine.fill(id, okx_btc(), Side::Long, dec!(1), 2),
+            Err(EngineError::InsufficientMargin)
+        );
+
+        let events = engine.deposit(id, "BTC", dec!(0.5), 3).unwrap();
+        assert_eq!(
+            events,
+            [Event::CollateralDeposited {
+                account: id,
+                asset: "BTC".into(),
+                amount: dec!(0.5),
+                at: 3
+            }]
+        );
+        engine
+            .fill(id, market("BTC"), Side::Long, dec!(1), 4)
+            .unwrap();
+        engine.fill(id, okx_btc(), Side::Short, dec!(1), 5).unwrap();
+
+        let view = engine.view(id).unwrap();
+        assert_eq!(view.collateral, dec!(0));
+        assert_eq!(
+            view.assets,
+            [AssetView {
+                asset: "BTC".into(),
+                amount: dec!(0.5),
+                haircut: Some(dec!(0.10)),
+                mark: Some(dec!(60_000)),
+                value: Some(dec!(27_000)),
+            }]
+        );
+        let health = view.health.unwrap();
+        // 0.5 BTC at 60,000 less 10%.
+        assert_eq!(health.collateral_value, dec!(27_000));
+        assert_eq!(health.equity, dec!(27_000));
+        // 60,000 at 1.25% plus 60,000 at 0.4%.
+        assert_eq!(health.maintenance_required, dec!(990));
+    }
+
+    #[test]
+    fn a_long_backed_by_the_same_coin_liquidates_sooner() {
+        let liquidation_price =
+            |engine: &Engine, id| match engine.view(id).unwrap().positions[0].liquidation_price {
+                Some(LiquidationPrice::At(px)) => px,
+                other => panic!("expected a price, got {other:?}"),
+            };
+
+        // 2,700 of dollars against a long of 1 BTC.
+        let mut dollars = coin_engine();
+        let (a, _) = dollars.create_account(dec!(2_700), 1).unwrap();
+        dollars
+            .fill(a, market("BTC"), Side::Long, dec!(1), 2)
+            .unwrap();
+
+        // The same 2,700 of equity held as 0.05 BTC.
+        let mut coins = coin_engine();
+        let (b, _) = coins.create_account(dec!(0), 1).unwrap();
+        coins.deposit(b, "BTC", dec!(0.05), 2).unwrap();
+        coins
+            .fill(b, market("BTC"), Side::Long, dec!(1), 3)
+            .unwrap();
+        assert_eq!(coins.view(b).unwrap().health.unwrap().equity, dec!(2_700));
+
+        // A falling price takes the collateral down with the position.
+        assert!(liquidation_price(&coins, b) > liquidation_price(&dollars, a));
+
+        // 58,100 is below the coin account's price and above the other's.
+        let px = dec!(58_100);
+        assert!(liquidation_price(&coins, b) > px && px > liquidation_price(&dollars, a));
+        let events = coins.set_mark(market("BTC"), Some(px), 10);
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, Event::Liquidated { .. }))
+        );
+        let events = dollars.set_mark(market("BTC"), Some(px), 10);
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, Event::Liquidated { .. }))
+        );
+
+        // Liquidation closes the position. The coin stays in the account.
+        let view = coins.view(b).unwrap();
+        assert!(matches!(view.state, AccountState::Closed { .. }));
+        assert_eq!(view.collateral, dec!(-1_900));
+        assert_eq!(view.assets[0].amount, dec!(0.05));
+    }
+
+    #[test]
+    fn a_short_covered_by_the_same_coin_is_never_liquidated_by_its_price() {
+        let mut engine = coin_engine();
+        let (id, _) = engine.create_account(dec!(0), 1).unwrap();
+        engine.deposit(id, "BTC", dec!(2), 2).unwrap();
+        engine
+            .fill(id, market("BTC"), Side::Short, dec!(1), 3)
+            .unwrap();
+        assert_eq!(
+            engine.view(id).unwrap().positions[0].liquidation_price,
+            Some(LiquidationPrice::Never)
+        );
+        // The price triples. The short loses 120,000, the coin gains 216,000.
+        assert!(
+            engine
+                .set_mark(market("BTC"), Some(dec!(180_000)), 4)
+                .is_empty()
+        );
+        assert_eq!(engine.view(id).unwrap().state, AccountState::Open);
+    }
+
+    #[test]
+    fn collateral_price_moves_reach_accounts_with_positions_elsewhere() {
+        let mut engine = coin_engine();
+        let (id, _) = engine.create_account(dec!(0), 1).unwrap();
+        engine.deposit(id, "BTC", dec!(0.05), 2).unwrap();
+        // The only position is on OKX. The collateral is priced on Hyperliquid.
+        engine.fill(id, okx_btc(), Side::Long, dec!(5), 3).unwrap();
+        // 2,700 of equity against 1,200 of maintenance.
+        assert_eq!(engine.view(id).unwrap().state, AccountState::Open);
+
+        // Hyperliquid falls. The OKX mark has not moved, so the position has
+        // no loss, but the collateral is now worth 900.
+        let events = engine.set_mark(market("BTC"), Some(dec!(20_000)), 4);
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, Event::Liquidated { .. }))
+        );
+
+        // With the collateral's mark gone, health is unknown.
+        let (id, _) = engine.create_account(dec!(0), 5).unwrap();
+        engine.deposit(id, "BTC", dec!(1), 6).unwrap();
+        engine.set_mark(market("BTC"), None, 7);
+        let view = engine.view(id).unwrap();
+        assert_eq!(view.health, None);
+        assert_eq!(view.assets[0].value, None);
+    }
+
+    #[test]
+    fn deposits_are_checked_and_a_dollar_deposit_adds_to_the_balance() {
+        let mut engine = coin_engine();
+        let (id, _) = engine.create_account(dec!(100), 1).unwrap();
+        assert_eq!(
+            engine.deposit(id, "DOGE", dec!(1), 2),
+            Err(EngineError::UnsupportedAsset("DOGE".into()))
+        );
+        assert_eq!(
+            engine.deposit(id, "BTC", dec!(0), 2),
+            Err(EngineError::NonPositiveDeposit(dec!(0)))
+        );
+        assert_eq!(
+            engine.deposit(AccountId(99), "BTC", dec!(1), 2),
+            Err(EngineError::UnknownAccount(AccountId(99)))
+        );
+        engine.deposit(id, "USDC", dec!(50), 3).unwrap();
+        let view = engine.view(id).unwrap();
+        assert_eq!(view.collateral, dec!(150));
+        assert!(view.assets.is_empty());
+    }
+
+    #[test]
+    fn a_deposit_can_end_a_margin_call() {
+        let (mut engine, id) = long_btc();
+        engine.schedule.insert_collateral(
+            "BTC",
+            crate::risk::CollateralRule::new(market("BTC"), dec!(0.10)).unwrap(),
+        );
+        engine.set_mark(market("BTC"), Some(dec!(58_000)), 10);
+        let events = engine.deposit(id, "BTC", dec!(0.1), 11).unwrap();
+        assert_eq!(
+            events[1],
+            Event::StateChanged {
+                account: id,
+                from: AccountState::MarginCall { since: 10 },
+                to: AccountState::Open,
+                at: 11
+            }
+        );
     }
 
     #[test]
@@ -718,6 +1010,23 @@ mod tests {
         };
         assert_eq!(run(), run());
         assert_eq!(run().0.len(), 6);
+    }
+
+    #[test]
+    fn deposit_events_serialize_as_tagged_json() {
+        let event = Event::CollateralDeposited {
+            account: AccountId(1),
+            asset: "BTC".into(),
+            amount: dec!(0.5),
+            at: 7,
+        };
+        assert_eq!(
+            serde_json::to_value(&event).unwrap(),
+            serde_json::json!({
+                "type": "collateral_deposited", "account": 1, "asset": "BTC",
+                "amount": "0.5", "at": 7
+            })
+        );
     }
 
     #[test]

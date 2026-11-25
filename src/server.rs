@@ -6,6 +6,7 @@
 //! - `GET /ws/{venue}/{coin}`    WebSocket: the current book, then every update
 //! - `POST /accounts`             open a paper account
 //! - `GET /accounts/{id}`         health, state and positions
+//! - `POST /accounts/{id}/deposits`  add collateral: dollars or a coin
 //! - `POST /accounts/{id}/fills`  fill a paper order at the mark
 //! - `GET /metrics`              process metrics for a Prometheus scraper
 //!
@@ -67,6 +68,13 @@ impl FromRef<AppState> for Metrics {
 struct CreateAccount {
     #[serde(with = "rust_decimal::serde::str")]
     collateral: Decimal,
+}
+
+#[derive(Debug, Deserialize)]
+struct DepositRequest {
+    asset: String,
+    #[serde(with = "rust_decimal::serde::str")]
+    amount: Decimal,
 }
 
 #[derive(Debug, Deserialize)]
@@ -133,16 +141,18 @@ struct Health {
     markets: Vec<MarketHealth>,
 }
 
-/// With `read_only` set, the two routes that change an account answer 403
-/// and never reach the engine.
+/// With `read_only` set, the routes that change an account answer 403 and
+/// never reach the engine.
 pub fn router(feeds: Feeds, engine: EngineHandle, metrics: Metrics, read_only: bool) -> Router {
     let writes = if read_only {
         Router::new()
             .route("/accounts", post(refuse_write))
+            .route("/accounts/{id}/deposits", post(refuse_write))
             .route("/accounts/{id}/fills", post(refuse_write))
     } else {
         Router::new()
             .route("/accounts", post(create_account))
+            .route("/accounts/{id}/deposits", post(deposit))
             .route("/accounts/{id}/fills", post(fill))
     };
     Router::new()
@@ -256,6 +266,8 @@ fn engine_error(error: EngineError) -> Response {
         EngineError::AccountClosed(_) | EngineError::InsufficientMargin => StatusCode::CONFLICT,
         EngineError::NoMark(_) | EngineError::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
         EngineError::NegativeCollateral(_)
+        | EngineError::NonPositiveDeposit(_)
+        | EngineError::UnsupportedAsset(_)
         | EngineError::UnsupportedMarket(_)
         | EngineError::PositionTooLarge { .. }
         | EngineError::InvalidFill(_) => StatusCode::BAD_REQUEST,
@@ -288,6 +300,17 @@ async fn account(State(engine): State<EngineHandle>, Path(id): Path<u64>) -> Res
     match engine.get(AccountId(id)).await {
         Ok(Some(view)) => Json(view).into_response(),
         Ok(None) => engine_error(EngineError::UnknownAccount(AccountId(id))),
+        Err(error) => engine_error(error),
+    }
+}
+
+async fn deposit(
+    State(engine): State<EngineHandle>,
+    Path(id): Path<u64>,
+    Json(body): Json<DepositRequest>,
+) -> Response {
+    match engine.deposit(AccountId(id), body.asset, body.amount).await {
+        Ok(view) => Json(view).into_response(),
         Err(error) => engine_error(error),
     }
 }

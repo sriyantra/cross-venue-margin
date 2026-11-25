@@ -2,8 +2,9 @@
 //! for every account, and proptest searches for an account that breaks it.
 
 use cross_venue_margin::risk::{
-    Account, AccountState, Health, LiquidationPrice, MarketId, Marks, Position, Schedule, Side,
-    SizeTable, Thresholds, TierTable, Venue, account_health, liquidation_price, step,
+    Account, AccountState, CollateralRule, Health, LiquidationPrice, MarketId, Marks, Position,
+    Schedule, Side, SizeTable, Thresholds, TierTable, Venue, account_health, liquidation_price,
+    step,
 };
 use proptest::prelude::*;
 use rust_decimal::{Decimal, dec};
@@ -50,6 +51,9 @@ fn schedule() -> Schedule {
         ])
         .unwrap(),
     );
+    for (coin, haircut) in [("BTC", dec!(0.10)), ("ETH", dec!(0.15))] {
+        schedule.insert_collateral(coin, CollateralRule::new(market(coin), haircut).unwrap());
+    }
     schedule
 }
 
@@ -96,6 +100,30 @@ fn account_and_marks() -> impl Strategy<Value = (Account, Marks)> {
             }
         }
         let marks = COINS.iter().map(|coin| market(coin)).zip(marks).collect();
+        (account, marks)
+    })
+}
+
+/// The accounts above, with BTC and ETH also held as collateral in amounts
+/// on the scale of the positions, and a dollar balance that can be below
+/// zero. Coins can outweigh a short in the same coin or fall short of it.
+fn account_with_coins() -> impl Strategy<Value = (Account, Marks)> {
+    let coins = proptest::collection::vec(proptest::option::of(size()), 2);
+    let cash = -15_000i64..=3_000;
+    (account_and_marks(), coins, cash).prop_map(|((plain, marks), coins, cash_bps)| {
+        let cost: Decimal = plain
+            .positions()
+            .map(|(_, position)| position.size() * position.entry_px())
+            .sum();
+        let mut account = Account::new((cost * Decimal::new(cash_bps, 4)).round_dp(2));
+        for (market, position) in plain.positions() {
+            account.set_position(market.clone(), *position);
+        }
+        for (coin, amount) in ["BTC", "ETH"].iter().zip(coins) {
+            if let Some(amount) = amount {
+                account.deposit(coin, amount).unwrap();
+            }
+        }
         (account, marks)
     })
 }
@@ -166,6 +194,75 @@ proptest! {
                     prop_assert_eq!(position.side(), Side::Short);
                     prop_assert!(margin_with(&account, &marks, target, tiny) < dec!(0));
                 }
+                LiquidationPrice::Below(px) => {
+                    prop_assert!(false, "no coin collateral, but got below {px}");
+                }
+            }
+        }
+    }
+
+    /// Coins held as collateral count at their mark less the haircut, and
+    /// nothing else about the account's numbers changes.
+    #[test]
+    fn coin_collateral_adds_its_haircut_value((account, marks) in account_with_coins()) {
+        let schedule = schedule();
+        let health = account_health(&account, &marks, &schedule).unwrap();
+
+        let mut value = dec!(0);
+        for (asset, amount) in account.assets() {
+            let haircut = if asset == "BTC" { dec!(0.10) } else { dec!(0.15) };
+            value += amount * marks[&market(asset)] * (dec!(1) - haircut);
+        }
+        prop_assert_eq!(health.collateral_value, value);
+        prop_assert_eq!(health.equity, account.collateral + value + health.unrealized_pnl);
+        prop_assert_eq!(health.margin_available, health.equity - health.maintenance_required);
+    }
+
+    /// With coins as collateral the liquidation price is still where margin
+    /// available is zero, including when the coin is the one the position
+    /// is in and its value moves with the same price.
+    #[test]
+    fn liquidation_price_holds_with_coin_collateral((account, marks) in account_with_coins()) {
+        let schedule = schedule();
+        let tiny = dec!(0.00000001);
+        let huge = dec!(10_000_000_000);
+
+        for (target, position) in account.positions() {
+            let margin = |px: Decimal| margin_with(&account, &marks, target, px);
+            match liquidation_price(&account, target, &marks, &schedule).unwrap() {
+                LiquidationPrice::At(px) => {
+                    prop_assert!(px > dec!(0));
+                    prop_assert!(margin(px).abs() < TOLERANCE, "margin at {px} is {}", margin(px));
+                    if px >= dec!(0.01) {
+                        match position.side() {
+                            Side::Long => prop_assert!(
+                                margin(px * dec!(1.01)) > dec!(0) && margin(px * dec!(0.99)) < dec!(0)
+                            ),
+                            Side::Short => prop_assert!(margin(px * dec!(1.01)) < dec!(0)),
+                        }
+                    }
+                }
+                LiquidationPrice::Below(px) => {
+                    prop_assert_eq!(position.side(), Side::Short);
+                    prop_assert!(px > dec!(0));
+                    prop_assert!(margin(px).abs() < TOLERANCE, "margin at {px} is {}", margin(px));
+                    prop_assert!(margin(huge) >= dec!(0));
+                    if px >= dec!(0.01) {
+                        prop_assert!(
+                            margin(px * dec!(1.01)) > dec!(0) && margin(px * dec!(0.99)) < dec!(0)
+                        );
+                    }
+                }
+                LiquidationPrice::Never => {
+                    prop_assert!(margin(tiny) >= dec!(0));
+                    if position.side() == Side::Short {
+                        prop_assert!(margin(huge) >= dec!(0));
+                    }
+                }
+                LiquidationPrice::AtAnyPrice => {
+                    prop_assert_eq!(position.side(), Side::Short);
+                    prop_assert!(margin(tiny) < dec!(0) && margin(huge) < dec!(0));
+                }
             }
         }
     }
@@ -206,6 +303,7 @@ proptest! {
             let (equity, maintenance) = (Decimal::from(equity), Decimal::from(maintenance));
             let health = Health {
                 equity,
+                collateral_value: dec!(0),
                 unrealized_pnl: dec!(0),
                 notional: dec!(0),
                 maintenance_required: maintenance,

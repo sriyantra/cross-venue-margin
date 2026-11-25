@@ -2,7 +2,8 @@
 //!
 //! The log is the record of what happened to every account, in order.
 //! Folding it from the start gives back every account's collateral,
-//! positions and state. Marks are not in the log. They are live data, and a
+//! positions and state. Collateral held in coins comes back as amounts.
+//! What it is worth is not in the log, because that depends on the marks. Marks are not in the log. They are live data, and a
 //! restored engine gets them from the feeds like a new one does.
 //!
 //! Every event is checked against the state it is applied to. A log that
@@ -39,6 +40,8 @@ pub enum Reason {
         logged: AccountState,
         replayed: AccountState,
     },
+    #[error("deposit of {0} is not above zero")]
+    Deposit(Decimal),
     #[error("liquidation of {0} does not match the position held")]
     Liquidation(MarketId),
     #[error(transparent)]
@@ -85,6 +88,17 @@ impl Engine {
                     },
                 );
                 self.next_id = self.next_id.max(account.0 + 1);
+            }
+            Event::CollateralDeposited {
+                account,
+                asset,
+                amount,
+                ..
+            } => {
+                if *amount <= Decimal::ZERO {
+                    return Err(Reason::Deposit(*amount));
+                }
+                self.open_entry(*account)?.account.deposit(asset, *amount)?;
             }
             Event::Filled {
                 account,
@@ -258,6 +272,50 @@ mod tests {
             reason(&wrong_state),
             Some((1, Reason::State { .. }))
         ));
+    }
+
+    #[test]
+    fn deposits_are_restored_and_a_log_from_before_them_still_loads() {
+        let (mut schedule, thresholds) = parts();
+        schedule.insert_collateral(
+            "BTC",
+            crate::risk::CollateralRule::new(btc(), dec!(0.10)).unwrap(),
+        );
+        let mut original = Engine::new(schedule.clone(), thresholds);
+        original.set_mark(btc(), Some(dec!(60_000)), 0);
+        let (id, mut events) = original.create_account(dec!(0), 1).unwrap();
+        events.extend(original.deposit(id, "BTC", dec!(0.5), 2).unwrap());
+        events.extend(original.deposit(id, "USDC", dec!(250), 3).unwrap());
+        events.extend(original.fill(id, btc(), Side::Long, dec!(1), 4).unwrap());
+
+        let mut restored = Engine::restore(schedule, thresholds, &events).unwrap();
+        assert!(restored.set_mark(btc(), Some(dec!(60_000)), 5).is_empty());
+        assert_eq!(restored.view(id), original.view(id));
+        assert_eq!(restored.view(id).unwrap().assets[0].amount, dec!(0.5));
+
+        let mut bad = events.clone();
+        bad[1] = Event::CollateralDeposited {
+            account: id,
+            asset: "BTC".into(),
+            amount: dec!(-1),
+            at: 2,
+        };
+        let (schedule, thresholds) = parts();
+        assert_eq!(
+            Engine::restore(schedule, thresholds, &bad)
+                .err()
+                .map(|e| (e.index, e.reason)),
+            Some((1, Reason::Deposit(dec!(-1))))
+        );
+
+        // An event written before deposits existed, exactly as stored.
+        let old = r#"{"type":"account_opened","account":1,"collateral":"100000","at":1}"#;
+        let old: Event = serde_json::from_str(old).unwrap();
+        let (schedule, thresholds) = parts();
+        let restored = Engine::restore(schedule, thresholds, [&old]).unwrap();
+        let view = restored.view(AccountId(1)).unwrap();
+        assert_eq!(view.collateral, dec!(100_000));
+        assert!(view.assets.is_empty());
     }
 
     #[test]

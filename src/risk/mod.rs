@@ -4,6 +4,8 @@
 //! set of mark prices and a maintenance schedule, and returns numbers. The
 //! margin model is gross: every position pays its own maintenance margin, and
 //! positions offset each other only through profit and loss in account equity.
+//! Collateral can be dollars or coins. A coin counts at its mark price less
+//! a haircut, so the account's equity moves with the price of what it holds.
 
 use rust_decimal::Decimal;
 use thiserror::Error;
@@ -15,11 +17,15 @@ mod num;
 pub mod schedule;
 pub mod types;
 
-pub use health::{Health, account_health};
+pub use health::{Health, account_health, asset_value};
 pub use lifecycle::{AccountState, ThresholdError, Thresholds, Transition, step};
 pub use liquidation::{LiquidationPrice, liquidation_price};
-pub use schedule::{MarginTable, Schedule, ScheduleError, SizeTable, SizeTier, Tier, TierTable};
-pub use types::{Account, Closed, MarketId, Marks, Position, PositionError, Side, Venue};
+pub use schedule::{
+    CollateralRule, MarginTable, Schedule, ScheduleError, SizeTable, SizeTier, Tier, TierTable,
+};
+pub use types::{
+    Account, CASH_ASSET, Closed, MarketId, Marks, Position, PositionError, Side, Venue,
+};
 
 /// Why a risk number could not be computed. Each of these means there is no
 /// trustworthy answer, so the caller must not fall back to an old one.
@@ -31,6 +37,8 @@ pub enum RiskError {
     MissingSchedule(MarketId),
     #[error("mark price {mark} for {market} is not positive")]
     InvalidMark { market: MarketId, mark: Decimal },
+    #[error("{0} is not accepted as collateral")]
+    UnsupportedAsset(String),
     #[error("no open position in {0}")]
     NoPosition(MarketId),
     #[error("position size {size} is above the largest size the schedule covers, {max}")]

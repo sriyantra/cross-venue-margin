@@ -3,7 +3,7 @@
 use rust_decimal::Decimal;
 use serde::Serialize;
 
-use super::health::mark_for;
+use super::health::{asset_value, mark_for};
 use super::num::{add, div, mul, sub};
 use super::{Account, MarginTable, MarketId, Marks, RiskError, Schedule, Side, Tier};
 
@@ -17,22 +17,38 @@ pub enum LiquidationPrice {
     /// except where a table's requirement steps up at a tier bound, in which
     /// case this is the bound and margin goes negative just past it.
     At(Decimal),
-    /// No price of this market can make the account liquidatable. Only a
-    /// long can be in this state, because its loss stops at a price of zero.
+    /// No price of this market can make the account liquidatable. A long is
+    /// in this state when its loss at a price of zero is covered. A short is
+    /// in this state when the account holds at least as much of the same
+    /// coin as collateral, so the collateral gains what the short loses.
     Never,
     /// The account is liquidatable at every price of this market. Only a
     /// short can be in this state.
     AtAnyPrice,
+    /// The account is safe above this price and liquidatable below it,
+    /// although the position is a short. This happens when collateral in
+    /// the same coin outweighs the short and the dollar balance is far
+    /// enough below zero that the coin's value is what keeps the account
+    /// solvent.
+    Below(Decimal),
 }
 
 /// Solves `equity(px) = maintenance(px)` for the mark of `market`.
 ///
 /// In one tier the margin available is a straight line in the price:
-/// `base + deduction + px * size * (sign - rate)`. In a table keyed by
-/// notional the rate and deduction change from tier to tier, so the answer
-/// is found by walking the tiers in the direction the price has to move. In
-/// a table keyed by size the position stays in one tier at every price, so
-/// there is a single line to solve.
+/// `base + deduction + px * (size * (sign - rate) + held)`, where `held` is
+/// the haircut amount of collateral priced by this same market. In a table
+/// keyed by notional the rate and deduction change from tier to tier, so
+/// the answer is found by walking the tiers in the direction the price has
+/// to move. In a table keyed by size the position stays in one tier at
+/// every price, so there is a single line to solve.
+///
+/// Collateral priced by another market is held at its current value, like
+/// every other mark. That includes the same coin on another venue.
+///
+/// A short with a dollar balance far below zero and only part of its size
+/// held as collateral can be liquidatable both below one price and above
+/// another. The upper one is reported.
 pub fn liquidation_price(
     account: &Account,
     market: &MarketId,
@@ -56,9 +72,19 @@ pub fn liquidation_price(
         }
     };
 
-    // Everything that does not move with this market's price: collateral,
-    // the other positions' PnL and maintenance, and this position's cost.
+    // Everything that does not move with this market's price: the dollar
+    // balance, collateral priced elsewhere, the other positions' PnL and
+    // maintenance, and this position's cost.
     let mut base = account.collateral;
+    let mut held = Decimal::ZERO;
+    for (asset, amount) in account.assets() {
+        let rule = schedule.collateral(asset)?;
+        if rule.price() == market {
+            held = add(held, mul(amount, rule.weight())?)?;
+        } else {
+            base = add(base, asset_value(asset, amount, marks, schedule)?)?;
+        }
+    }
     for (other, held) in account.positions() {
         if other == market {
             continue;
@@ -72,7 +98,7 @@ pub fn liquidation_price(
     let sign = position.side().sign();
     base = sub(base, mul(mul(sign, size)?, position.entry_px())?)?;
 
-    let slope = |tier: &Tier| mul(size, sub(sign, tier.rate)?);
+    let slope = |tier: &Tier| add(mul(size, sub(sign, tier.rate)?)?, held);
     let margin_at = |tier: &Tier, px: Decimal| -> Result<Decimal, RiskError> {
         add(add(base, tier.deduction)?, mul(px, slope(tier)?)?)
     };
@@ -112,16 +138,38 @@ pub fn liquidation_price(
                 i -= 1;
             }
         }
-        // Margin falls as the price rises. Walk up from the first tier.
+        // Without collateral in this coin, margin falls as the price rises.
+        // Walk up from the first tier. Collateral in this coin can make the
+        // margin rise with the price in the lower tiers, so each tier's
+        // slope is checked instead of assumed.
         Side::Short => {
             let mut i = 0;
-            loop {
-                let tier = &tiers[i];
-                if i == 0 {
-                    if margin_at(tier, Decimal::ZERO)? <= Decimal::ZERO {
+            let mut lower = None;
+            if margin_at(&tiers[0], Decimal::ZERO)? < Decimal::ZERO
+                && slope(&tiers[0])? > Decimal::ZERO
+            {
+                // Liquidatable at a price of zero, with margin rising. Climb
+                // to the price where the account becomes safe.
+                loop {
+                    let tier = &tiers[i];
+                    let rise = slope(tier)?;
+                    if rise <= Decimal::ZERO {
                         return Ok(LiquidationPrice::AtAnyPrice);
                     }
-                } else {
+                    let px = div(-add(base, tier.deduction)?, rise)?;
+                    match tiers.get(i + 1).and_then(bound_px) {
+                        Some(top) if px >= top => i += 1,
+                        _ => {
+                            lower = Some(px);
+                            break;
+                        }
+                    }
+                }
+            }
+            let mut walked = false;
+            loop {
+                let tier = &tiers[i];
+                if walked {
                     // The requirement can step up at a bound. If that step
                     // alone takes the margin negative, the bound is the price.
                     // This tier was only entered because its bound is a
@@ -130,10 +178,25 @@ pub fn liquidation_price(
                     if margin_at(tier, bottom)? < Decimal::ZERO {
                         return Ok(LiquidationPrice::At(bottom));
                     }
+                } else if lower.is_none() {
+                    let at_zero = margin_at(tier, Decimal::ZERO)?;
+                    if at_zero < Decimal::ZERO
+                        || (at_zero.is_zero() && slope(tier)? < Decimal::ZERO)
+                    {
+                        return Ok(LiquidationPrice::AtAnyPrice);
+                    }
                 }
                 match tiers.get(i + 1).and_then(bound_px) {
-                    Some(top) if margin_at(tier, top)? >= Decimal::ZERO => i += 1,
-                    _ => return root(tier),
+                    Some(top) if margin_at(tier, top)? >= Decimal::ZERO => {
+                        i += 1;
+                        walked = true;
+                    }
+                    _ if slope(tier)? < Decimal::ZERO => return root(tier),
+                    // Margin does not fall in the last tier the price can
+                    // reach, so there is no upper price.
+                    _ => {
+                        return Ok(lower.map_or(LiquidationPrice::Never, LiquidationPrice::Below));
+                    }
                 }
             }
         }
@@ -179,6 +242,87 @@ mod tests {
         account_health(account, &marks, schedule)
             .unwrap()
             .margin_available
+    }
+
+    /// The schedule above, accepting BTC as collateral at a 10% haircut.
+    fn coin_schedule() -> Schedule {
+        let mut schedule = schedule();
+        schedule.insert_collateral(
+            "BTC",
+            crate::risk::CollateralRule::new(market("BTC"), dec!(0.10)).unwrap(),
+        );
+        schedule
+    }
+
+    fn with_coin(mut account: Account, amount: Decimal) -> Account {
+        account.deposit("BTC", amount).unwrap();
+        account
+    }
+
+    #[test]
+    fn collateral_in_the_same_coin_moves_with_the_price() {
+        let schedule = coin_schedule();
+        let get = |account: &Account| {
+            liquidation_price(account, &market("BTC"), &Marks::new(), &schedule).unwrap()
+        };
+
+        // Long 1 with 0.05 BTC: margin is -60,000 + px * (0.9875 + 0.045).
+        let long = with_coin(
+            one_position(dec!(0), Side::Long, dec!(1), dec!(60_000)),
+            dec!(0.05),
+        );
+        assert_eq!(
+            get(&long),
+            LiquidationPrice::At(dec!(60_000) / dec!(1.0325))
+        );
+
+        // Short 1 with 0.5 BTC: margin is 63,000 + px * (0.45 - 1.0125).
+        let part = with_coin(
+            one_position(dec!(3_000), Side::Short, dec!(1), dec!(60_000)),
+            dec!(0.5),
+        );
+        assert_eq!(get(&part), LiquidationPrice::At(dec!(112_000)));
+
+        // Short 1 with 2 BTC: the coin gains more than the short loses.
+        let covered = with_coin(
+            one_position(dec!(0), Side::Short, dec!(1), dec!(60_000)),
+            dec!(2),
+        );
+        assert_eq!(get(&covered), LiquidationPrice::Never);
+
+        // The same, 100,000 in debt: margin is -40,000 + px * (2.7 - 1.0125),
+        // so the account needs the coin to be worth enough.
+        let in_debt = with_coin(
+            one_position(dec!(-100_000), Side::Short, dec!(1), dec!(60_000)),
+            dec!(3),
+        );
+        assert_eq!(
+            get(&in_debt),
+            LiquidationPrice::Below(dec!(40_000) / dec!(1.6875))
+        );
+    }
+
+    #[test]
+    fn collateral_priced_by_another_market_is_held_at_its_value() {
+        let mut schedule = schedule();
+        schedule.insert_collateral(
+            "ETH",
+            crate::risk::CollateralRule::new(market("ETH"), dec!(0.15)).unwrap(),
+        );
+        let mut account = one_position(dec!(0), Side::Long, dec!(1), dec!(60_000));
+        account.deposit("ETH", dec!(1)).unwrap();
+        // 1 ETH at 3,000 less 15% is 2,550 of fixed collateral.
+        let marks = Marks::from([(market("ETH"), dec!(3_000))]);
+        let dollars = one_position(dec!(2_550), Side::Long, dec!(1), dec!(60_000));
+        assert_eq!(
+            price(&account, &marks, &schedule),
+            price(&dollars, &marks, &schedule)
+        );
+        // Without the ETH mark the collateral has no value to use.
+        assert_eq!(
+            liquidation_price(&account, &market("BTC"), &Marks::new(), &schedule),
+            Err(RiskError::MissingMark(market("ETH")))
+        );
     }
 
     #[test]

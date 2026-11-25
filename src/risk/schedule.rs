@@ -51,6 +51,8 @@ pub enum ScheduleError {
     NonPositiveBound(Decimal),
     #[error("tier values overflow")]
     Overflow,
+    #[error("haircut {0} must be at least 0 and below 1")]
+    HaircutOutOfRange(Decimal),
 }
 
 /// The validated tier table for one market.
@@ -246,10 +248,46 @@ impl From<SizeTable> for MarginTable {
     }
 }
 
-/// The maintenance table of every market the engine knows.
+/// How one collateral asset counts toward equity.
+///
+/// The asset is valued at the mark of `price`, and only `1 - haircut` of
+/// that value counts. The haircut is the cushion against the asset losing
+/// value before it could be sold.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CollateralRule {
+    price: MarketId,
+    haircut: Decimal,
+}
+
+impl CollateralRule {
+    pub fn new(price: MarketId, haircut: Decimal) -> Result<Self, ScheduleError> {
+        if haircut < Decimal::ZERO || haircut >= Decimal::ONE {
+            return Err(ScheduleError::HaircutOutOfRange(haircut));
+        }
+        Ok(Self { price, haircut })
+    }
+
+    /// The market whose mark prices the asset.
+    pub fn price(&self) -> &MarketId {
+        &self.price
+    }
+
+    pub fn haircut(&self) -> Decimal {
+        self.haircut
+    }
+
+    /// The share of the asset's value that counts: `1 - haircut`.
+    pub fn weight(&self) -> Decimal {
+        Decimal::ONE - self.haircut
+    }
+}
+
+/// The maintenance table of every market the engine knows, and the rule
+/// for every asset it accepts as collateral.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Schedule {
     tables: BTreeMap<MarketId, MarginTable>,
+    collateral: BTreeMap<String, CollateralRule>,
 }
 
 impl Schedule {
@@ -269,6 +307,20 @@ impl Schedule {
         self.tables
             .get(market)
             .ok_or_else(|| RiskError::MissingSchedule(market.clone()))
+    }
+
+    pub fn insert_collateral(
+        &mut self,
+        asset: impl Into<String>,
+        rule: CollateralRule,
+    ) -> Option<CollateralRule> {
+        self.collateral.insert(asset.into(), rule)
+    }
+
+    pub fn collateral(&self, asset: &str) -> Result<&CollateralRule, RiskError> {
+        self.collateral
+            .get(asset)
+            .ok_or_else(|| RiskError::UnsupportedAsset(asset.to_string()))
     }
 }
 

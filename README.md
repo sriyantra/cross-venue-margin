@@ -2,13 +2,16 @@
 
 A Rust service that keeps live order books from more than one trading venue and
 computes margin for accounts whose positions span those venues on a single
-collateral balance.
+pool of collateral. The collateral can be dollars, BTC or ETH. Coins are
+kept as coins and valued at their live mark price, with no conversion.
 
 Status: all four roadmap stages are done, and a read-only instance is
 running (see Live instance). Two venues are connected, Hyperliquid and
 OKX, with live books and mark prices from both. A paper account can hold
-positions on both venues against one collateral balance, each margined by
-its own venue's rules and marked at its own venue's price. Every account
+positions on both venues against one pool of collateral, each margined by
+its own venue's rules and marked at its own venue's price. Collateral
+held in BTC or ETH is revalued on every mark, so a falling coin lowers the
+account's equity and can liquidate it. Every account
 event goes to an append-only log in Postgres, and the service rebuilds its
 accounts from that log when it starts.
 
@@ -33,14 +36,19 @@ Accounts are paper accounts. The service places no orders and holds no funds.
   resubscribed. Sizes are converted from contracts to coin.
 - OKX mark price per market (`mark-price`), with the same staleness rule.
 - HTTP and WebSocket API over the current books and marks.
-- Paper accounts with one collateral balance. Orders fill at the venue's
+- Paper accounts with one pool of collateral. Orders fill at the venue's
   mark. A fill that would leave the account in a margin call is refused.
+- Multi-asset collateral. An account can deposit USDC, BTC and ETH. A coin
+  stays a coin: it counts toward equity at its Hyperliquid mark less a
+  haircut, and it backs positions on both venues.
 - Account health and each position's liquidation price, recomputed when a
-  mark changes.
+  mark changes. A liquidation price accounts for collateral in the same
+  coin: a long backed by its own coin liquidates sooner, and a short
+  covered by at least as much of the coin has no liquidation price.
 - An account state machine: open, margin call, liquidating, closed. An
   account whose equity falls below maintenance margin is closed out at the
   mark.
-- Every account event (opened, filled, state changed, liquidated) is
+- Every account event (opened, deposit, filled, state changed, liquidated) is
   written to an append-only Postgres table through a bounded channel. A
   slow or failing database slows the engine down. It does not drop events.
 - On start the service reads the log in order and rebuilds every account
@@ -72,20 +80,34 @@ Accounts are paper accounts. The service places no orders and holds no funds.
 - The Hyperliquid numbers are checked against the venue's own (see Test).
   OKX account data is not public, so the OKX numbers are checked against
   its documented formula only.
-- Equity is collateral plus unrealized profit and loss at the venue's mark.
-  Funding and fees are not modeled.
+- Equity is the dollar balance, plus the value of coins held as
+  collateral, plus unrealized profit and loss at the venue's mark. Funding
+  and fees are not modeled.
+- A coin held as collateral counts for `amount * mark * (1 - haircut)`.
+  The haircuts are 10% for BTC and 15% for ETH. They are this project's
+  own numbers and are not taken from a venue.
+- A coin is priced at Hyperliquid's perpetual mark for that coin, not at a
+  spot price. Its value follows that one mark, including when it backs a
+  position on OKX.
+- Profit and loss settle in dollars. An account funded only with coins
+  goes to a negative dollar balance when it realizes a loss, and the coins
+  still count toward its equity. No interest is charged on that balance.
+- Coins are never sold. Liquidation closes positions and leaves the coins
+  in the account. There are no withdrawals.
 - Liquidation closes every position at the mark in one step. Real venues
   liquidate in stages and at worse prices.
 - A mark that gaps past the liquidation price leaves the closed account
   with negative collateral. There is no insurance fund or bad-debt handling.
-- While any of an account's markets has no current mark, its health is
+- While any of an account's markets has no current mark, or the mark that
+  prices its collateral is missing, its health is
   unknown and its state is frozen. It is not liquidated on an old price,
   even if its other positions are losing.
 
 ## Live instance
 
 A deployment of this repository's Docker image, with Postgres for the
-event log. It is read-only: the two `POST` routes answer 403. Account 1 is
+event log. It is read-only: the `POST` routes answer 403. It runs the
+last pushed version of this repository. Account 1 is
 a paper account that is long BTC on one venue and short the same size on
 the other, against one balance.
 
@@ -134,7 +156,8 @@ Environment:
 | `GET /ws/{venue}/{coin}`   | WebSocket: the current book, then every update |
 
 | `POST /accounts`            | Open a paper account. Body: `{"collateral":"5000"}` |
-| `GET /accounts/{id}`        | State, health, and positions with liquidation prices |
+| `GET /accounts/{id}`        | State, health, collateral assets, and positions with liquidation prices |
+| `POST /accounts/{id}/deposits` | Add collateral. Body: `{"asset":"BTC","amount":"0.5"}`. Assets: `USDC`, `BTC`, `ETH` |
 | `POST /accounts/{id}/fills` | Fill at the mark. Body: `{"venue":"hyperliquid","coin":"BTC","side":"long","size":"0.5"}` |
 | `GET /metrics`              | Metrics in the OpenMetrics text format |
 
@@ -143,6 +166,8 @@ Amounts are JSON strings, so no value passes through a binary float.
 ```sh
 curl -s localhost:8080/book/hyperliquid/BTC
 curl -s -H 'content-type: application/json' -d '{"collateral":"5000"}' localhost:8080/accounts
+curl -s -H 'content-type: application/json' -d '{"asset":"BTC","amount":"0.5"}' \
+  localhost:8080/accounts/1/deposits
 curl -s -H 'content-type: application/json' \
   -d '{"venue":"hyperliquid","coin":"BTC","side":"long","size":"0.5"}' \
   localhost:8080/accounts/1/fills
@@ -175,6 +200,7 @@ Postgres     --events in order, at startup--> engine (rebuilt before it runs)
   so a slow consumer slows the engine instead of dropping an event.
 - The event log holds what happened to accounts, not the marks that
   caused it. Replaying it rebuilds collateral, positions and state exactly.
+  Coins come back as amounts, and their value comes from the live marks.
   It does not re-run the decisions, because mark prices are not recorded.
   The database rejects any update, delete or truncate on the table.
 - An API reply can reach the client before its event is committed to
@@ -219,14 +245,16 @@ cargo test
 - `tests/risk_props.rs` holds property tests for the risk core: health is
   additive over positions, margin available is zero at the liquidation
   price, fills at the mark conserve equity, and the state machine always
-  matches the latest health reading.
+  matches the latest health reading. The liquidation price rule is also
+  checked for accounts holding BTC and ETH as collateral, with dollar
+  balances above and below zero.
 - `tests/venue_parity.rs` compares the risk core with Hyperliquid's own
   numbers for 11 real accounts recorded from its public API on 2026-11-22
   (addresses removed). Maintenance margin and every liquidation price must
   match. The sample holds only accounts with BTC and ETH cross positions and
   no collateral outside the perp balance.
-- `tests/restore_props.rs` runs random histories of accounts, fills and
-  mark moves on both venues, rebuilds a second engine from the events
+- `tests/restore_props.rs` runs random histories of accounts, deposits,
+  fills and mark moves on both venues, rebuilds a second engine from the events
   alone, and requires it to report every account exactly as the first one
   does. It also requires a log cut off at any event to restore.
 - `tests/event_store.rs` runs the store against a real Postgres: restore

@@ -132,13 +132,22 @@ impl Position {
     }
 }
 
-/// One collateral balance backing positions on any number of venues.
+/// The asset the dollar balance is held in. A deposit of it adds to
+/// `Account::collateral` one for one.
+pub const CASH_ASSET: &str = "USDC";
+
+/// One pool of collateral backing positions on any number of venues.
 ///
-/// Positions live in a `BTreeMap`, so they are always visited in the same
-/// order. Results cannot depend on insertion order.
+/// `collateral` is the dollar balance. Profit and loss settle into it, so
+/// it can go negative while coins held as collateral still cover it.
+/// `assets` are coins held as collateral, kept in kind and never sold.
+///
+/// Positions and assets live in `BTreeMap`s, so they are always visited in
+/// the same order. Results cannot depend on insertion order.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Account {
     pub collateral: Decimal,
+    assets: BTreeMap<String, Decimal>,
     positions: BTreeMap<MarketId, Position>,
 }
 
@@ -146,8 +155,29 @@ impl Account {
     pub fn new(collateral: Decimal) -> Self {
         Self {
             collateral,
+            assets: BTreeMap::new(),
             positions: BTreeMap::new(),
         }
+    }
+
+    /// Adds `amount` of `asset` to the account's collateral. The caller
+    /// checks that the amount is positive and the asset is accepted. On an
+    /// error the account is unchanged.
+    pub fn deposit(&mut self, asset: &str, amount: Decimal) -> Result<(), RiskError> {
+        if asset == CASH_ASSET {
+            self.collateral = add(self.collateral, amount)?;
+            return Ok(());
+        }
+        let held = self.assets.get(asset).copied().unwrap_or(Decimal::ZERO);
+        self.assets.insert(asset.to_string(), add(held, amount)?);
+        Ok(())
+    }
+
+    /// Coins held as collateral, with the amount of each.
+    pub fn assets(&self) -> impl Iterator<Item = (&str, Decimal)> {
+        self.assets
+            .iter()
+            .map(|(asset, amount)| (asset.as_str(), *amount))
     }
 
     /// Sets the position for a market and returns the one it replaced.
