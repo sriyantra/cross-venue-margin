@@ -1,220 +1,117 @@
 # cross-venue-margin
 
-A Rust service that keeps live order books from more than one trading venue and
-computes margin for accounts whose positions span those venues on a single
-pool of collateral. The collateral can be dollars, BTC or ETH. Coins are
-kept as coins and valued at their live mark price, with no conversion.
+One margin account across two venues.
 
-Status: all five roadmap stages are done, and a read-only instance is
-running (see Live instance). Two venues are connected, Hyperliquid and
-OKX, with live books and mark prices from both. A paper account can hold
-positions on both venues against one pool of collateral, each margined by
-its own venue's rules and marked at its own venue's price. Collateral
-held in BTC or ETH is revalued on every mark, so a falling coin lowers the
-account's equity and can liquidate it. Every account
-event goes to an append-only log in Postgres, and the service rebuilds its
-accounts from that log when it starts.
+A Rust service that keeps live order books and mark prices from Hyperliquid
+and OKX and runs a risk engine over accounts whose positions sit on both,
+backed by a single pool of collateral in USDC, BTC or ETH. A long on one
+venue against a short on the other is margined as a hedge, not as two
+outright positions. Every account event is appended to Postgres, and the
+service rebuilds its state from that log when it starts.
 
-By default accounts are paper accounts and the service places no orders.
-Given a Hyperliquid testnet key, fills on Hyperliquid markets become real
-orders on the venue's testnet (see Testnet execution). It never sends an
-order to mainnet and never holds real funds.
+Accounts trade on paper against the live books. With a testnet key, orders
+on Hyperliquid markets are signed and sent to the venue's testnet instead.
 
-## What works today
+## Try it
 
-- Hyperliquid connector on the `l2` channel: one snapshot per market, then
-  diffs (base64 plus raw DEFLATE), applied to an in-memory book.
-- Desync detection. A diff that cannot be applied, a crossed book, or a
-  timestamp that moves backwards clears the book and triggers a resubscribe
-  for that market.
-- Reconnect with exponential backoff, an application ping, and a staleness
-  watchdog that drops a connection that has gone quiet.
-- Readers never see a book that is known to be wrong. While a book is being
-  rebuilt, the API reports it as stale.
-- The venue's mark price per market (`activeAssetCtx`), withdrawn if the
-  venue stops refreshing it.
-- OKX connector for USDT perpetuals on the `books` channel: one 400-level
-  snapshot, then updates keyed by price. Every update must name the
-  sequence number of the message before it, or the book is cleared and
-  resubscribed. Sizes are converted from contracts to coin.
-- OKX mark price per market (`mark-price`), with the same staleness rule.
-- HTTP and WebSocket API over the current books and marks.
-- Paper accounts with one pool of collateral. An order walks the venue's
-  live book: a buy takes asks and a sell takes bids, level by level, and
-  fills at the average. An order larger than that side of the book is
-  refused.
-- Initial margin at each venue's max leverage. A fill that grows a position
-  is refused when equity would be below the account's initial margin
-  requirement, or when it would leave the account in a margin call.
-- Order execution on Hyperliquid testnet, when a testnet key is set. The
-  engine checks the order, the service signs it and sends it, and the
-  engine records the size and average price the venue reports. A
-  reconciliation route compares the positions the engine has recorded with
-  the positions the wallet holds on the venue.
-- Netting across venues. A long on one venue and a short in the same coin
-  on the other are matched, and the matched size pays a hedge rate on each
-  leg instead of each venue's full requirement.
-- Multi-asset collateral. An account can deposit USDC, BTC and ETH. A coin
-  stays a coin: it counts toward equity at its Hyperliquid mark less a
-  haircut, and it backs positions on both venues.
-- Account health and each position's liquidation price, recomputed when a
-  mark changes. A liquidation price accounts for collateral in the same
-  coin: a long backed by its own coin liquidates sooner, and a short
-  covered by at least as much of the coin has no liquidation price.
-- An account state machine: open, margin call, liquidating, closed. An
-  account whose equity falls below maintenance margin is closed out
-  against the book: longs are sold into the bids and shorts bought from
-  the asks.
-- Every account event (opened, deposit, filled, state changed, liquidated) is
-  written to an append-only Postgres table through a bounded channel. A
-  slow or failing database slows the engine down. It does not drop events.
-- On start the service reads the log in order and rebuilds every account
-  from it. A log that does not describe a possible history is rejected.
-- Metrics for a Prometheus scraper, including a histogram of the time from
-  a mark price arriving to the engine having acted on it.
+A read-only instance runs this repository's image:
+
+```sh
+BASE=https://margin-production-1f4db33a.up.railway.app
+curl -s $BASE/accounts/1        # long BTC on one venue, short on the other
+curl -s $BASE/book/okx/BTC
+curl -s $BASE/metrics
+```
+
+Locally:
+
+```sh
+cargo run --release             # live feeds, accounts kept in memory
+docker compose up --build       # the same, with Postgres for the event log
+```
+
+```sh
+curl -s -H 'content-type: application/json' localhost:8080/accounts \
+  -d '{"collateral":"5000"}'
+curl -s -H 'content-type: application/json' localhost:8080/accounts/1/deposits \
+  -d '{"asset":"BTC","amount":"0.5"}'
+curl -s -H 'content-type: application/json' localhost:8080/accounts/1/fills \
+  -d '{"venue":"hyperliquid","coin":"BTC","side":"long","size":"0.5"}'
+curl -s -H 'content-type: application/json' localhost:8080/accounts/1/fills \
+  -d '{"venue":"okx","coin":"BTC","side":"short","size":"0.5"}'
+```
+
+The second fill lowers the account's margin requirement, because the two
+positions now hedge each other.
+
+## Design
+
+```
+venue task (owns socket + books) --watch: book, mark--> API handlers
+                                 --watch: book, mark--> engine task (owns accounts)
+API handlers --bounded mpsc: commands, one-shot replies--> engine task
+engine task  --bounded mpsc: events--> log writer --> Postgres (append-only)
+Postgres     --events in order, at startup--> engine
+```
+
+- Each venue connector is one Tokio task that owns its socket and its
+  books. One more task owns the engine and every account. Nothing is
+  shared, so there are no locks around books or accounts.
+- Books and marks go through `watch` channels, which keep only the latest
+  value. A slow reader skips ahead and cannot build a backlog. Events go
+  through a bounded queue, so a slow database slows the engine down and
+  never drops an event.
+- `book`, `risk` and `engine` have no I/O and no clock. The engine takes
+  the time as an argument and returns the events it caused, which is what
+  makes it testable by replay and by property tests.
+- A book that fails a consistency check (a diff that does not apply, a
+  crossed book, a sequence gap) is cleared and resubscribed. Until it is
+  rebuilt the API reports it as stale, and a mark the venue stops
+  refreshing is withdrawn. An account with a missing mark is frozen, not
+  liquidated on an old price.
+- Prices and sizes are decimals parsed from the venue's strings. Nothing
+  passes through a binary float.
 
 ## Margin model
 
-- Cross margin with netting of hedged pairs. A position pays its own
-  venue's maintenance margin, except for the part of it that is matched by
-  an opposite position in the same coin on the other venue.
-- The matched part of each leg pays `matched size * mark * hedge rate`
-  for maintenance and twice that for initial margin. The hedge rate is
-  0.25% by default (`HEDGE_MARGIN_RATE`). It is this project's own number.
-  It stands for the risk that is left on a matched pair, which is the gap
-  between the two venues' marks. The unmatched part of the larger leg
-  pays its venue's table for its own size.
-- Netting assumes collateral can cover a loss on either venue at once.
-  Between real venues it cannot, and nothing here charges for the time it
-  takes to move it. `HEDGE_MARGIN_RATE=off` gives gross margin, where every
-  position pays in full.
-- Only the same coin on different venues is netted. There is no offset
-  between different coins, and no scenario or stress-based margin.
-- Initial margin is `notional / max leverage` for the bracket a position
-  is in: twice the maintenance rate on Hyperliquid by its rule, and OKX's
-  published initial rate per tier (1% for the first, read on 2026-11-25).
-  There is no leverage setting per account or per position.
-- Maintenance margin per position is `notional * rate - deduction`, from a
-  tier table per market. The Hyperliquid tables for BTC and ETH are built
-  from the max-leverage brackets in its documentation (read on 2026-11-22),
-  using its rule that the maintenance rate is half the initial margin rate
-  at max leverage. Other markets have no table and positions in them are
+|             | Hyperliquid                                   | OKX                                              |
+| ----------- | --------------------------------------------- | ------------------------------------------------ |
+| Maintenance | Tiers by notional: `notional * rate - deduction` | Tiers by size: the tier's rate on the whole notional |
+| Initial     | Twice the maintenance rate                    | The venue's published rate per tier              |
+| Markets     | BTC, ETH                                      | BTC, ETH USDT perpetuals, first 12 tiers         |
+
+- Equity is the dollar balance, plus coins held as collateral, plus
+  unrealized profit and loss at each venue's own mark.
+- Collateral in BTC or ETH stays a coin. It counts for
+  `amount * mark * (1 - haircut)`, with haircuts of 10% and 15%, and is
+  revalued on every mark. A long backed by its own coin liquidates sooner.
+  A short covered by the coin has no liquidation price.
+- The part of a position matched by an opposite position in
+  the same coin on the other venue pays a hedge rate (0.25% of notional,
+  `HEDGE_MARGIN_RATE`) for the gap between the two marks. The rest pays
+  its venue's table.
+- Fills walk the live book and take the average price. An order larger
+  than the book, or one that would leave equity below initial margin, is
   refused.
-- OKX keys its tiers by position size instead. The rate of the tier a
-  position's size falls in applies to its whole notional, so the
-  requirement steps up when a fill crosses a tier bound. The BTC and ETH
-  tables hold the first 12 tiers from its public position tiers endpoint
-  (read on 2026-11-22), which covers 2,000 BTC and 25,000 ETH. Larger
-  positions are refused.
-- OKX perpetuals settle in USDT. One USDT is counted as one dollar of the
-  account's collateral, with no conversion rate.
-- OKX adds a liquidation fee to the maintenance requirement. That fee is
-  not modeled, so an OKX position here liquidates slightly later than it
-  would on the venue.
-- The Hyperliquid numbers are checked against the venue's own (see Test).
-  OKX account data is not public, so the OKX numbers are checked against
-  its documented formula only.
-- Equity is the dollar balance, plus the value of coins held as
-  collateral, plus unrealized profit and loss at the venue's mark. Funding
-  and fees are not modeled.
-- A coin held as collateral counts for `amount * mark * (1 - haircut)`.
-  The haircuts are 10% for BTC and 15% for ETH. They are this project's
-  own numbers and are not taken from a venue.
-- A coin is priced at Hyperliquid's perpetual mark for that coin, not at a
-  spot price. Its value follows that one mark, including when it backs a
-  position on OKX.
-- Profit and loss settle in dollars. An account funded only with coins
-  goes to a negative dollar balance when it realizes a loss, and the coins
-  still count toward its equity. No interest is charged on that balance.
-- Coins are never sold. Liquidation closes positions and leaves the coins
-  in the account. There are no withdrawals.
-- Liquidation closes every position in one step against the book the
-  service has at that moment. Size the book cannot take is priced at its
-  last level. Hyperliquid's feed carries 20 levels a side, so a large
-  position is priced as if the 20th level were bottomless. Real venues
-  liquidate in stages. With no live book for a market, fills and
-  liquidations there use the mark.
-- Paper fills do not move the book. Two fills in a row see the same
-  liquidity.
-- A mark that gaps past the liquidation price leaves the closed account
-  with negative collateral. There is no insurance fund or bad-debt handling.
-- While any of an account's markets has no current mark, or the mark that
-  prices its collateral is missing, its health is
-  unknown and its state is frozen. It is not liquidated on an old price,
-  even if its other positions are losing.
+- Funding is charged when each venue settles it: hourly on Hyperliquid,
+  at the venue's announced time on OKX. A position pays or receives
+  `size * mark * rate` in dollars at the rate the venue published.
+- An account moves through open, margin call, liquidating
+  and closed. Below maintenance margin every position is closed against
+  the book.
 
-## Live instance
+The Hyperliquid numbers are checked against the venue's own: maintenance
+margin and every liquidation price match for 11 real accounts recorded
+from its public API. OKX account data is not public, so those numbers are
+checked against its documented formula.
 
-A deployment of this repository's Docker image, with Postgres for the
-event log. It is read-only: the `POST` routes answer 403. It runs the
-last pushed version of this repository. Account 1 is
-a paper account that is long BTC on one venue and short the same size on
-the other, against one balance.
-
-```sh
-curl -s https://margin-production-1f4db33a.up.railway.app/health
-curl -s https://margin-production-1f4db33a.up.railway.app/accounts/1
-curl -s https://margin-production-1f4db33a.up.railway.app/book/okx/BTC
-curl -s https://margin-production-1f4db33a.up.railway.app/metrics
-```
-
-## Run
-
-```sh
-cargo run --release
-```
-
-Or with Docker, which also starts Postgres for the event log:
-
-```sh
-docker compose up --build
-```
-
-The image is a static release build on a distroless base, about 49 MB,
-running as a non-root user.
-
-Environment:
-
-| Variable    | Default                        | Meaning                    |
-| ----------- | ------------------------------ | -------------------------- |
-| `HL_WS_URL` | `wss://api.hyperliquid.xyz/ws` | Hyperliquid WebSocket URL  |
-| `OKX_WS_URL` | `wss://ws.okx.com:443/ws/v5/public` | OKX public WebSocket URL |
-| `COINS`     | `BTC,ETH`                      | Coins to track on each venue that lists them |
-| `BIND`      | `127.0.0.1:8080`               | API listen address         |
-| `DATABASE_URL` | unset                       | Postgres URL for the event log. Without it events are only logged and accounts are lost on restart |
-| `MARGIN_CALL_MULTIPLE` | `1.5`               | Margin call starts when equity is below maintenance margin times this |
-| `HEDGE_MARGIN_RATE` | `0.0025`              | Maintenance rate on the matched part of a long and a short in the same coin on different venues. `off` for gross margin |
-| `READ_ONLY` | `false`                        | When `true`, the routes that change an account answer 403 |
-| `HL_TESTNET_KEY` | unset                     | Private key of a Hyperliquid testnet wallet. When set, fills on Hyperliquid markets are orders on testnet, and Hyperliquid books and marks come from testnet. `HL_WS_URL` cannot be set with it |
-| `RUST_LOG`  | `info`                         | Log filter                 |
-
-## API
-
-| Route              | Returns                                              |
-| ------------------ | ---------------------------------------------------- |
-| `GET /health`      | Per-market liveness and age. 503 if any book or mark is stale |
-| `GET /book/{venue}/{coin}` | The current book. 503 with `{"type":"stale"}` if not live |
-| `GET /mark/{venue}/{coin}` | The venue's mark price. 503 with `{"type":"stale"}` if not live |
-| `GET /ws/{venue}/{coin}`   | WebSocket: the current book, then every update |
-
-| `POST /accounts`            | Open a paper account. Body: `{"collateral":"5000"}` |
-| `GET /accounts/{id}`        | State, health, collateral assets, and positions with liquidation prices |
-| `POST /accounts/{id}/deposits` | Add collateral. Body: `{"asset":"BTC","amount":"0.5"}`. Assets: `USDC`, `BTC`, `ETH` |
-| `POST /accounts/{id}/fills` | Fill against the book. Body: `{"venue":"hyperliquid","coin":"BTC","side":"long","size":"0.5"}` |
-| `GET /venues/hyperliquid/reconciliation` | The accounts' net position per coin against the wallet's position on the venue. 404 without a testnet key |
-| `GET /metrics`              | Metrics in the OpenMetrics text format |
-
-Amounts are JSON strings, so no value passes through a binary float.
-
-```sh
-curl -s localhost:8080/book/hyperliquid/BTC
-curl -s -H 'content-type: application/json' -d '{"collateral":"5000"}' localhost:8080/accounts
-curl -s -H 'content-type: application/json' -d '{"asset":"BTC","amount":"0.5"}' \
-  localhost:8080/accounts/1/deposits
-curl -s -H 'content-type: application/json' \
-  -d '{"venue":"hyperliquid","coin":"BTC","side":"long","size":"0.5"}' \
-  localhost:8080/accounts/1/fills
-```
+Not modeled: trading fees, OKX's liquidation fee, a USDT/USD rate,
+offsets between different coins, the time it takes to move collateral
+between venues, staged liquidation, an insurance fund, and selling coin
+collateral. The haircuts and the hedge rate are my own numbers. Paper
+fills do not move the book. Funding is charged on the mark, where
+Hyperliquid uses its oracle price, and a settlement that passes while the
+service is down is not charged afterwards.
 
 ## Testnet execution
 
@@ -222,148 +119,84 @@ curl -s -H 'content-type: application/json' \
 HL_TESTNET_KEY=0x... cargo run --release
 ```
 
-With a key, `POST /accounts/{id}/fills` on a Hyperliquid market does this:
+With a key, a fill on a Hyperliquid market becomes a real order:
 
 1. The engine checks the order against the account, the margin rules and
-   its copy of the testnet book, and returns the price it expects. Nothing
-   changes yet. An order the account cannot carry stops here.
-2. The service signs an order and sends it to the venue: a limit order 5%
-   through the expected price that cancels whatever does not fill at once.
-3. The engine records the fill at the size and average price the venue
-   reports. A partial fill is recorded as the part that filled.
+   the testnet book. Nothing changes yet.
+2. The service signs an immediate-or-cancel limit order, 5% through the
+   expected price, and sends it.
+3. The engine records the size and average price the venue reports.
 
-Fills on OKX stay on paper.
+The engine task never waits on the venue: the API handler makes the call
+between the two engine commands. All accounts trade through one wallet, and
+`GET /venues/hyperliquid/reconciliation` compares the sum of their
+positions with what the wallet holds. A position the engine liquidates is
+closed on the venue by a separate task.
 
-- Every account's orders go through one wallet, so the wallet's position in
-  a coin is the sum of the accounts' positions in it.
-  `GET /venues/hyperliquid/reconciliation` shows both and the difference.
-- When the engine liquidates a position on Hyperliquid, it closes it in its
-  own books at once and a separate task sends the closing order to the
-  venue. The price the venue gives can differ from the one the engine
-  recorded.
-- Hyperliquid books and marks come from testnet, whose prices are not
-  mainnet's. OKX prices stay live, so the two venues can disagree by more
-  than they do in production.
-- The signing is checked against the venue's reference client: the same
-  key, order and nonce must give the same signature. The signature is
-  bound to testnet: on mainnet it does not verify as this wallet's.
-- If a request to the venue times out, the order can have filled without
-  the engine recording it. Reconciliation shows the difference. Nothing
-  repairs it automatically.
-- The wallet's own collateral on the venue is not tied to the accounts'
-  collateral in the engine, and venue fees are not charged to accounts.
+Signing (MessagePack action hash, EIP-712, secp256k1) is tested against the
+venue's reference client: same key, order and nonce, same signature. The
+signature is bound to testnet.
 
-## Design
+Limits: OKX fills stay on paper. A request that times out can leave a fill
+the engine did not record, which reconciliation reports and nothing
+repairs. Venue fees are not charged to accounts. Hyperliquid prices come
+from testnet in this mode, and testnet is not mainnet.
 
-```
-venue task (owns socket + books) --watch: book, mark--> API handlers
-                                 --watch: mark, book--> engine task (owns accounts)
-API handlers --bounded mpsc: commands, one-shot replies--> engine task
-engine task  --bounded mpsc: events--> log writer task --> Postgres (append-only)
-Postgres     --events in order, at startup--> engine (rebuilt before it runs)
-```
+## Configuration
 
-- `book` is pure. It has no I/O and no clock, so it is tested by replaying
-  frames recorded from the live feed (`tests/fixtures`).
-- Each venue connector is one Tokio task that owns its socket and its books.
-  Nothing else can mutate a book, so there are no locks around book state.
-- Books are published through `tokio::sync::watch`, which keeps only the
-  latest value. A slow reader skips to the newest book and cannot build a
-  backlog.
-- `risk` and `engine` are pure too. The engine takes the time as an
-  argument and returns the events it caused, so the same inputs always
-  produce the same events.
-- One Tokio task owns the engine and its accounts. Handlers reach it only
-  by sending a command and waiting for the reply.
-- State where only the latest value matters (books, marks) goes through
-  watch channels. Events that must not be lost go through a bounded queue,
-  so a slow consumer slows the engine instead of dropping an event.
-- The event log holds what happened to accounts, not the marks that
-  caused it. Replaying it rebuilds collateral, positions and state exactly.
-  Coins come back as amounts, and their value comes from the live marks.
-  It does not re-run the decisions, because mark prices are not recorded.
-  The database rejects any update, delete or truncate on the table.
-- The engine task never waits on a venue. An order for testnet is sent by
-  the API handler between two engine commands, one that checks it and one
-  that records what filled. Handlers take turns, so two orders never
-  interleave those steps.
-- An API reply can reach the client before its event is committed to
-  Postgres. A crash in that window loses the event.
-- Prices and sizes are `rust_decimal::Decimal`, parsed from the venue's
-  strings. No binary floats.
+| Variable               | Default          | Meaning |
+| ---------------------- | ---------------- | ------- |
+| `COINS`                | `BTC,ETH`        | Coins to track on each venue that lists them |
+| `BIND`                 | `127.0.0.1:8080` | API listen address |
+| `DATABASE_URL`         | unset            | Postgres URL for the event log. Without it accounts are lost on restart |
+| `MARGIN_CALL_MULTIPLE` | `1.5`            | A margin call starts when equity is below maintenance margin times this |
+| `HEDGE_MARGIN_RATE`    | `0.0025`         | Maintenance rate on the matched part of a hedged pair. `off` for gross margin |
+| `READ_ONLY`            | `false`          | Refuse every route that changes an account |
+| `HL_TESTNET_KEY`       | unset            | Testnet wallet key. Turns on testnet execution |
+| `HL_WS_URL`            | mainnet          | Hyperliquid WebSocket URL. Cannot be set with `HL_TESTNET_KEY` |
+| `OKX_WS_URL`           | mainnet          | OKX public WebSocket URL |
 
-## Metrics
+## API
 
-| Metric | Meaning |
-| ------ | ------- |
-| `feed_to_decision_seconds{venue}` | Histogram. Starts when a mark price frame is read off the socket. Stops when the engine has rechecked every account against that price |
-| `engine_events_total{kind}` | Account events the engine emitted |
-| `feed_reconnects_total{venue}` | Venue sessions that ended and were reconnected |
-| `book_resyncs_total{venue}` | Books cleared and resubscribed after a desync |
-| `event_log_write_seconds` | Histogram. Time to commit one batch of events |
-| `event_log_write_failures_total` | Event log writes that failed and were retried |
+| Route | Returns |
+| ----- | ------- |
+| `GET /health` | Liveness and age of every book and mark. 503 if any is stale |
+| `GET /book/{venue}/{coin}` | The current book |
+| `GET /mark/{venue}/{coin}` | The venue's mark price |
+| `GET /ws/{venue}/{coin}` | WebSocket: the current book, then every update |
+| `POST /accounts` | Open an account. `{"collateral":"5000"}` |
+| `GET /accounts/{id}` | State, health, collateral and positions with liquidation prices |
+| `POST /accounts/{id}/deposits` | Add collateral. `{"asset":"BTC","amount":"0.5"}` |
+| `POST /accounts/{id}/fills` | Fill an order. `{"venue":"okx","coin":"BTC","side":"short","size":"0.5"}` |
+| `GET /venues/hyperliquid/reconciliation` | Engine positions against the testnet wallet |
+| `GET /metrics` | Prometheus metrics |
 
-- `feed_to_decision_seconds` covers this process only: decoding the frame,
-  the hand-off to the engine task, and the margin check. It does not
-  include the network path from the venue or the time to write the
-  resulting events.
-- A mark that is replaced before the engine wakes is never applied, so it
-  is not in the histogram. A frame that repeats the current price is not
-  in it either.
+`/metrics` includes `feed_to_decision_seconds`, a histogram from a mark
+price frame being read off the socket to the engine having rechecked every
+account against it. It covers this process only, not the network path.
 
-## Test
+## Tests
 
 ```sh
 cargo test
+TEST_DATABASE_URL=postgres://postgres@127.0.0.1:5432/postgres cargo test
 ```
 
-- Unit tests for book mutation and frame decoding.
-- `tests/replay.rs` replays a recorded BTC session and checks ordering,
-  depth, and uncrossed invariants after every message.
-- `tests/connector.rs` runs the connector against a local fake venue to
-  cover desync recovery, reconnect, and mark publication.
-- `tests/replay_okx.rs` replays 120 recorded OKX frames and checks the
-  sequence chain and the same book invariants.
-- `tests/connector_okx.rs` runs the OKX connector against a local fake
-  venue: sizes in coin, a sequence gap, and a reconnect.
-- `tests/risk_props.rs` holds property tests for the risk core: health is
-  additive over positions, margin available is zero at the liquidation
-  price, fills at the mark conserve equity, and the state machine always
-  matches the latest health reading. The liquidation price rule is also
-  checked for accounts holding BTC and ETH as collateral, with dollar
-  balances above and below zero, and for accounts with hedged legs on both
-  venues. Netting must never raise a requirement and must change nothing
-  when no long faces a short in the same coin.
-- `tests/venue_parity.rs` compares the risk core with Hyperliquid's own
-  numbers for 11 real accounts recorded from its public API on 2026-11-22
-  (addresses removed). Maintenance margin and every liquidation price must
-  match. The sample holds only accounts with BTC and ETH cross positions and
-  no collateral outside the perp balance.
-- `tests/restore_props.rs` runs random histories of accounts, deposits,
-  fills and mark moves on both venues, rebuilds a second engine from the events
-  alone, and requires it to report every account exactly as the first one
-  does. It also requires a log cut off at any event to restore.
-- `tests/event_store.rs` runs the store against a real Postgres: restore
-  after a restart, exact decimals, all-or-nothing appends, and rejected
-  updates and deletes. It needs `TEST_DATABASE_URL` and reports a skip
-  without it:
-  `TEST_DATABASE_URL=postgres://postgres@127.0.0.1:5432/postgres cargo test`
-- `tests/server.rs` runs the API on a local port and checks that a
-  read-only instance refuses writes before they reach the engine.
-- `tests/execution.rs` runs the API with order execution on, against a
-  local stand-in for the venue: the order that is sent, a partial fill
-  recorded at the venue's price, refusals by the engine and by the venue,
-  reconciliation, and the closing order for a liquidation.
-- `tests/engine.rs` runs the engine task against hand-driven mark channels:
-  liquidation on a mark move, a withdrawn mark, a dead connector, and a
-  fill priced off a book.
+- Sessions recorded from both venues are replayed through the
+  book code, with ordering and uncrossed-book checks after every message.
+- Margin and liquidation prices are compared with Hyperliquid's own
+  numbers for 11 recorded accounts.
+- Property tests: margin available is zero at the liquidation price,
+  netting never raises a requirement, and an engine rebuilt from its own
+  event log reports every account exactly as the original does.
+- The connectors run against local fake venues: desync recovery, sequence
+  gaps, reconnects.
+- Execution runs the API against a stand-in venue: the order sent,
+  partial fills, refusals from either side, reconciliation.
+- The event store runs against a real Postgres when `TEST_DATABASE_URL` is
+  set: restore after restart, all-or-nothing appends, rejected updates and
+  deletes.
 
-## Roadmap
+## License
 
-1. Hyperliquid connector, book, API. Done.
-2. Risk engine: paper accounts, account health, liquidation price, and an
-   explicit account state machine. Done.
-3. Second venue, an append-only event log in Postgres, and rebuilding
-   state from that log. Done.
-4. Docker image, metrics for feed-to-decision latency, deployment. Done.
-5. Order execution on Hyperliquid testnet, with reconciliation. Done.
+MIT
