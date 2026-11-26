@@ -105,6 +105,11 @@ async fn main() -> Result<()> {
         match table {
             Some(table) => {
                 schedule.insert(market.clone(), table);
+                let fee = match market.venue {
+                    Venue::Hyperliquid => venue::hyperliquid::TAKER_FEE,
+                    Venue::Okx => venue::okx::TAKER_FEE,
+                };
+                schedule.set_fee(market.clone(), fee)?;
             }
             None => warn!(%market, "no maintenance table, positions will be refused"),
         }

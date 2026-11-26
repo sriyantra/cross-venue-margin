@@ -339,6 +339,7 @@ pub struct Schedule {
     tables: BTreeMap<MarketId, MarginTable>,
     collateral: BTreeMap<String, CollateralRule>,
     hedge_rate: Option<Decimal>,
+    fees: BTreeMap<MarketId, Decimal>,
 }
 
 impl Schedule {
@@ -374,6 +375,20 @@ impl Schedule {
 
     pub fn hedge_rate(&self) -> Option<Decimal> {
         self.hedge_rate
+    }
+
+    /// Sets the share of a fill's notional a market charges as a fee.
+    pub fn set_fee(&mut self, market: MarketId, rate: Decimal) -> Result<(), ScheduleError> {
+        if rate < Decimal::ZERO || rate >= Decimal::ONE {
+            return Err(ScheduleError::RateOutOfRange(rate));
+        }
+        self.fees.insert(market, rate);
+        Ok(())
+    }
+
+    /// The fee rate of a market. Zero for a market that has none set.
+    pub fn fee(&self, market: &MarketId) -> Decimal {
+        self.fees.get(market).copied().unwrap_or(Decimal::ZERO)
     }
 
     pub fn insert_collateral(

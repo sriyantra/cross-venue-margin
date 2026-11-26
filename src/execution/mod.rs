@@ -521,6 +521,7 @@ mod tests {
             size: dec!(0.5),
             px: dec!(60000),
             realized_pnl: dec!(-100),
+            fee: dec!(0),
             at: 1,
         };
         assert_eq!(

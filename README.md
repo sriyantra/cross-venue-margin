@@ -90,9 +90,10 @@ Postgres     --events in order, at startup--> engine
   the same coin on the other venue pays a hedge rate (0.25% of notional,
   `HEDGE_MARGIN_RATE`) for the gap between the two marks. The rest pays
   its venue's table.
-- Fills walk the live book and take the average price. An order larger
-  than the book, or one that would leave equity below initial margin, is
-  refused.
+- Fills walk the live book and take the average price, and pay the
+  venue's base taker fee (0.045% on Hyperliquid, 0.05% on OKX). An order
+  larger than the book, or one that would leave equity below initial
+  margin, is refused.
 - Funding is charged when each venue settles it: hourly on Hyperliquid,
   at the venue's announced time on OKX. A position pays or receives
   `size * mark * rate` in dollars at the rate the venue published.
@@ -105,7 +106,7 @@ margin and every liquidation price match for 11 real accounts recorded
 from its public API. OKX account data is not public, so those numbers are
 checked against its documented formula.
 
-Not modeled: trading fees, OKX's liquidation fee, a USDT/USD rate,
+Not modeled: fee tiers and maker fees, OKX's liquidation fee, a USDT/USD rate,
 offsets between different coins, the time it takes to move collateral
 between venues, staged liquidation, an insurance fund, and selling coin
 collateral. The haircuts and the hedge rate are my own numbers. Paper
@@ -139,8 +140,9 @@ signature is bound to testnet.
 
 Limits: OKX fills stay on paper. A request that times out can leave a fill
 the engine did not record, which reconciliation reports and nothing
-repairs. Venue fees are not charged to accounts. Hyperliquid prices come
-from testnet in this mode, and testnet is not mainnet.
+repairs. Accounts pay the venue's base taker rate, not the fee the venue
+reports for each fill. Hyperliquid prices come from testnet in this mode,
+and testnet is not mainnet.
 
 ## Configuration
 

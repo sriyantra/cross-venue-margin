@@ -107,6 +107,7 @@ impl Engine {
                 size,
                 px,
                 realized_pnl,
+                fee,
                 ..
             } => {
                 let entry = self.open_entry(*account)?;
@@ -118,6 +119,11 @@ impl Engine {
                         replayed,
                     });
                 }
+                entry.account.collateral = entry
+                    .account
+                    .collateral
+                    .checked_sub(*fee)
+                    .ok_or(RiskError::Overflow)?;
             }
             Event::StateChanged {
                 account, from, to, ..
@@ -137,6 +143,7 @@ impl Engine {
                 side,
                 size,
                 realized_pnl,
+                fee,
                 ..
             } => {
                 let entry = self.open_entry(*account)?;
@@ -152,6 +159,7 @@ impl Engine {
                     .account
                     .collateral
                     .checked_add(*realized_pnl)
+                    .and_then(|balance| balance.checked_sub(*fee))
                     .ok_or(RiskError::Overflow)?;
             }
             Event::Funding {
@@ -385,5 +393,25 @@ mod tests {
 
         let restored = restore(&events).unwrap();
         assert_eq!(restored.view(id).unwrap().collateral, dec!(29_994));
+    }
+
+    #[test]
+    fn fees_are_restored() {
+        let (mut schedule, thresholds) = parts();
+        schedule.set_fee(btc(), dec!(0.0005)).unwrap();
+        let mut engine = Engine::new(schedule.clone(), thresholds);
+        engine.set_mark(btc(), Some(dec!(60_000)), 0);
+        let (id, mut events) = engine.create_account(dec!(3_000), 1).unwrap();
+        events.extend(engine.fill(id, btc(), Side::Long, dec!(1), 2).unwrap());
+        events.extend(engine.set_mark(btc(), Some(dec!(57_000)), 3));
+        assert!(events.iter().any(|e| matches!(e, Event::Liquidated { .. })));
+
+        let restored = Engine::restore(schedule, thresholds, &events).unwrap();
+        assert_eq!(restored.view(id), {
+            // A restored engine has no marks, so compare without them.
+            engine.set_mark(btc(), None, 4);
+            engine.view(id)
+        });
+        assert_eq!(restored.view(id).unwrap().collateral, dec!(-58.5));
     }
 }

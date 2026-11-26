@@ -34,6 +34,10 @@ use crate::risk::{TierTable, Venue};
 
 const VENUE: Venue = Venue::Hyperliquid;
 
+/// The venue's taker fee for perpetuals at its base tier, from its fee
+/// schedule (read on 2026-11-26).
+pub const TAKER_FEE: Decimal = dec!(0.00045);
+
 /// How often to send an application-level ping.
 const PING_EVERY: Duration = Duration::from_secs(5);
 /// If no frame of any kind arrives for this long, treat the connection as

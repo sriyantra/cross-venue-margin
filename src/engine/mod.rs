@@ -76,6 +76,10 @@ pub enum Event {
         size: Decimal,
         px: Decimal,
         realized_pnl: Decimal,
+        /// What the venue charged for the trade, taken from the dollar
+        /// balance. Absent from the JSON when zero.
+        #[serde(default, skip_serializing_if = "Decimal::is_zero")]
+        fee: Decimal,
         at: u64,
     },
     StateChanged {
@@ -93,6 +97,10 @@ pub enum Event {
         size: Decimal,
         px: Decimal,
         realized_pnl: Decimal,
+        /// What the venue charged for the trade, taken from the dollar
+        /// balance. Absent from the JSON when zero.
+        #[serde(default, skip_serializing_if = "Decimal::is_zero")]
+        fee: Decimal,
         at: u64,
     },
     /// A funding payment on one position. `amount` is the change to the
@@ -454,8 +462,8 @@ impl Engine {
         size: Decimal,
         now: u64,
     ) -> Result<Vec<Event>, EngineError> {
-        let (account, px, realized_pnl) = self.priced(id, &market, side, size, None)?;
-        self.commit(id, account, market, side, size, px, realized_pnl, now)
+        let priced = self.priced(id, &market, side, size, None)?;
+        self.commit(id, priced, market, side, size, now)
     }
 
     /// Says whether `fill` would accept this order, without changing
@@ -469,7 +477,7 @@ impl Engine {
         size: Decimal,
     ) -> Result<Decimal, EngineError> {
         self.priced(id, market, side, size, None)
-            .map(|(_, px, _)| px)
+            .map(|priced| priced.px)
     }
 
     /// Records a fill that a venue has already made, at the venue's price.
@@ -486,8 +494,8 @@ impl Engine {
         px: Decimal,
         now: u64,
     ) -> Result<Vec<Event>, EngineError> {
-        let (account, px, realized_pnl) = self.priced(id, &market, side, size, Some(px))?;
-        self.commit(id, account, market, side, size, px, realized_pnl, now)
+        let priced = self.priced(id, &market, side, size, Some(px))?;
+        self.commit(id, priced, market, side, size, now)
     }
 
     /// The sum of every account's position in each coin on one venue, longs
@@ -518,7 +526,7 @@ impl Engine {
         side: Side,
         size: Decimal,
         at: Option<Decimal>,
-    ) -> Result<(Account, Decimal, Decimal), EngineError> {
+    ) -> Result<Priced, EngineError> {
         let entry = self
             .accounts
             .get(&id)
@@ -552,6 +560,13 @@ impl Engine {
         let mut account = entry.account.clone();
         let before = account.position(market).copied();
         let realized_pnl = account.apply_fill(market.clone(), fill)?;
+        // The venue's fee comes out of the balance before the margin rules
+        // are applied, so an order cannot be opened with the fee unpaid.
+        let fee = trade_fee(&self.schedule, market, size, px)?;
+        account.collateral = account
+            .collateral
+            .checked_sub(fee)
+            .ok_or(RiskError::Overflow)?;
         let grows = match (before, account.position(market)) {
             (_, None) => false,
             (None, Some(_)) => true,
@@ -570,34 +585,37 @@ impl Engine {
                 return Err(EngineError::InsufficientMargin);
             }
         }
-        Ok((account, px, realized_pnl))
+        Ok(Priced {
+            account,
+            px,
+            realized_pnl,
+            fee,
+        })
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn commit(
         &mut self,
         id: AccountId,
-        account: Account,
+        priced: Priced,
         market: MarketId,
         side: Side,
         size: Decimal,
-        px: Decimal,
-        realized_pnl: Decimal,
         now: u64,
     ) -> Result<Vec<Event>, EngineError> {
         let entry = self
             .accounts
             .get_mut(&id)
             .ok_or(EngineError::UnknownAccount(id))?;
-        entry.account = account;
+        entry.account = priced.account;
 
         let mut events = vec![Event::Filled {
             account: id,
             market,
             side,
             size,
-            px,
-            realized_pnl,
+            px: priced.px,
+            realized_pnl: priced.realized_pnl,
+            fee: priced.fee,
             at: now,
         }];
         reassess(
@@ -696,6 +714,26 @@ impl Engine {
     }
 }
 
+/// The account a fill would leave behind, and what the fill cost.
+struct Priced {
+    account: Account,
+    px: Decimal,
+    realized_pnl: Decimal,
+    fee: Decimal,
+}
+
+/// What a venue charges for trading `size` at `px`.
+fn trade_fee(
+    schedule: &Schedule,
+    market: &MarketId,
+    size: Decimal,
+    px: Decimal,
+) -> Result<Decimal, RiskError> {
+    size.checked_mul(px)
+        .and_then(|notional| notional.checked_mul(schedule.fee(market)))
+        .ok_or(RiskError::Overflow)
+}
+
 /// Brings one account's state in line with the current marks, liquidating
 /// it if it has fallen below maintenance margin.
 #[allow(clippy::too_many_arguments)]
@@ -765,6 +803,12 @@ fn try_reassess(
                 .unwrap_or(mark))
         };
         for closed in entry.account.close_all_at(exit)? {
+            let fee = trade_fee(schedule, &closed.market, closed.position.size(), closed.px)?;
+            entry.account.collateral = entry
+                .account
+                .collateral
+                .checked_sub(fee)
+                .ok_or(RiskError::Overflow)?;
             events.push(Event::Liquidated {
                 account: id,
                 market: closed.market,
@@ -772,6 +816,7 @@ fn try_reassess(
                 size: closed.position.size(),
                 px: closed.px,
                 realized_pnl: closed.realized_pnl,
+                fee,
                 at: now,
             });
         }
@@ -1271,6 +1316,7 @@ mod tests {
                     size: dec!(1),
                     px: dec!(57_700),
                     realized_pnl: dec!(-2_300),
+                    fee: dec!(0),
                     at: 20
                 },
                 Event::StateChanged {
@@ -1458,6 +1504,7 @@ mod tests {
             size: dec!(0.5),
             px: dec!(60_000),
             realized_pnl: dec!(0),
+            fee: dec!(0),
             at: 7,
         };
         assert_eq!(
@@ -1574,5 +1621,84 @@ mod tests {
         engine.set_funding(okx_btc(), funding(dec!(0.0001), 10));
         assert_eq!(engine.settle_funding(10).len(), 2);
         assert_eq!(engine.view(id).unwrap().collateral, dec!(10_000));
+    }
+
+    /// The BTC engine with a fee of 0.05% of notional on every trade.
+    fn fee_engine() -> Engine {
+        let mut schedule = Schedule::new();
+        schedule.insert(market("BTC"), TierTable::flat(dec!(0.0125)).unwrap());
+        schedule.set_fee(market("BTC"), dec!(0.0005)).unwrap();
+        let mut engine = Engine::new(schedule, Thresholds::new(dec!(1.5)).unwrap());
+        engine.set_mark(market("BTC"), Some(dec!(60_000)), 0);
+        engine
+    }
+
+    #[test]
+    fn a_fill_pays_the_venue_fee_from_the_balance() {
+        let mut engine = fee_engine();
+        let (id, _) = engine.create_account(dec!(3_000), 1).unwrap();
+        let events = engine
+            .fill(id, market("BTC"), Side::Long, dec!(1), 2)
+            .unwrap();
+        assert!(matches!(events[0], Event::Filled { fee, .. } if fee == dec!(30)));
+        assert_eq!(engine.view(id).unwrap().collateral, dec!(2_970));
+
+        // Closing pays again, on the closing notional.
+        engine.set_mark(market("BTC"), Some(dec!(61_000)), 3);
+        let events = engine
+            .fill(id, market("BTC"), Side::Short, dec!(1), 4)
+            .unwrap();
+        assert!(matches!(events[0], Event::Filled { fee, .. } if fee == dec!(30.5)));
+        assert_eq!(engine.view(id).unwrap().collateral, dec!(3_939.5));
+    }
+
+    #[test]
+    fn the_fee_counts_against_the_margin_check() {
+        // 1 BTC at 60,000 needs 1,500 of initial margin here. 1,520 covers
+        // it, but not after a fee of 30.
+        let mut engine = fee_engine();
+        let (id, _) = engine.create_account(dec!(1_520), 1).unwrap();
+        assert_eq!(
+            engine.fill(id, market("BTC"), Side::Long, dec!(1), 2),
+            Err(EngineError::InsufficientMargin)
+        );
+        assert_eq!(engine.view(id).unwrap().collateral, dec!(1_520));
+    }
+
+    #[test]
+    fn a_liquidation_pays_the_fee_too() {
+        let mut engine = fee_engine();
+        let (id, _) = engine.create_account(dec!(3_000), 1).unwrap();
+        engine
+            .fill(id, market("BTC"), Side::Long, dec!(1), 2)
+            .unwrap();
+        let events = engine.set_mark(market("BTC"), Some(dec!(57_000)), 3);
+        let fee = events.iter().find_map(|event| match event {
+            Event::Liquidated { fee, .. } => Some(*fee),
+            _ => None,
+        });
+        assert_eq!(fee, Some(dec!(28.5)));
+        // 3,000 less the entry fee, the loss and the exit fee.
+        assert_eq!(engine.view(id).unwrap().collateral, dec!(-58.5));
+    }
+
+    #[test]
+    fn a_fee_is_in_the_json_only_when_it_is_charged() {
+        let mut engine = fee_engine();
+        let (id, _) = engine.create_account(dec!(3_000), 1).unwrap();
+        let events = engine
+            .fill(id, market("BTC"), Side::Long, dec!(1), 2)
+            .unwrap();
+        let json = serde_json::to_value(&events[0]).unwrap();
+        assert_eq!(json["fee"], "30.0000");
+
+        // An event written before fees existed still reads, with no fee.
+        let old = serde_json::json!({
+            "type": "filled", "account": 1, "venue": "hyperliquid", "coin": "BTC",
+            "side": "long", "size": "0.5", "px": "60000", "realized_pnl": "0", "at": 7
+        });
+        let event: Event = serde_json::from_value(old.clone()).unwrap();
+        assert!(matches!(event, Event::Filled { fee, .. } if fee.is_zero()));
+        assert_eq!(serde_json::to_value(&event).unwrap(), old);
     }
 }

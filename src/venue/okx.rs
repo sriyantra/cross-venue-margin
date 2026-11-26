@@ -37,6 +37,10 @@ use crate::risk::{SizeTable, Venue};
 
 const VENUE: Venue = Venue::Okx;
 
+/// The venue's taker fee for perpetuals at its first fee level, from its
+/// help center (read on 2026-11-26).
+pub const TAKER_FEE: Decimal = dec!(0.0005);
+
 /// How often to send the text `ping` the venue answers with `pong`.
 const PING_EVERY: Duration = Duration::from_secs(5);
 /// If no frame of any kind arrives for this long, treat the connection as
