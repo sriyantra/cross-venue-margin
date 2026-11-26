@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use cross_venue_margin::engine::task::{self, Command, EngineHandle};
 use cross_venue_margin::engine::{AccountView, Engine, EngineError, Event};
-use cross_venue_margin::feed::{Feeds, MarkTx, MarkView};
+use cross_venue_margin::feed::{Feeds, FundingView, MarkTx, MarkView};
 use cross_venue_margin::metrics::Metrics;
 use cross_venue_margin::risk::{
     AccountState, MarketId, Schedule, Side, Thresholds, TierTable, Venue,
@@ -56,6 +56,7 @@ fn start_with_event_queue(capacity: usize) -> Harness {
     let task = tokio::spawn(task::run(
         engine,
         marks,
+        Vec::new(),
         Vec::new(),
         command_rx,
         event_tx,
@@ -333,6 +334,7 @@ async fn fill_is_priced_off_the_book_the_task_was_given() {
         engine,
         vec![(btc(), feeds.subscribe_mark(&btc()).unwrap())],
         vec![(btc(), feeds.subscribe(&btc()).unwrap())],
+        Vec::new(),
         command_rx,
         event_tx,
         Metrics::new(),
@@ -383,4 +385,74 @@ async fn fill_is_priced_off_the_book_the_task_was_given() {
     shutdown.cancel();
     task.await.unwrap();
     while events.recv().await.is_some() {}
+}
+
+#[tokio::test]
+async fn funding_from_the_feed_is_charged_when_it_settles() {
+    let (feeds, mut publishers) = Feeds::channels(&[btc()]);
+    let mut schedule = Schedule::new();
+    schedule.insert(btc(), TierTable::flat(dec!(0.0125)).unwrap());
+    let engine = Engine::new(schedule, Thresholds::new(dec!(1.5)).unwrap());
+    let (command_tx, command_rx) = mpsc::channel::<Command>(8);
+    let (event_tx, mut events) = mpsc::channel(64);
+    let shutdown = CancellationToken::new();
+    let task = tokio::spawn(task::run(
+        engine,
+        vec![(btc(), feeds.subscribe_mark(&btc()).unwrap())],
+        Vec::new(),
+        feeds
+            .funding_receivers()
+            .map(|(market, rx)| (market.clone(), rx))
+            .collect(),
+        command_rx,
+        event_tx,
+        Metrics::new(),
+        shutdown.clone(),
+    ));
+    let handle = EngineHandle::new(command_tx);
+    let publisher = publishers.take(Venue::Hyperliquid).remove("BTC").unwrap();
+
+    publish(&publisher.mark, dec!(60_000));
+    let account = handle.create_account(dec!(3_000)).await.unwrap();
+    tokio::time::timeout(WAIT, async {
+        loop {
+            match handle.fill(account.id, btc(), Side::Long, dec!(1)).await {
+                Ok(_) => return,
+                Err(EngineError::NoMark(_)) => tokio::time::sleep(Duration::from_millis(5)).await,
+                Err(other) => panic!("fill failed: {other}"),
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for the first mark");
+
+    // The venue settles two seconds from now. The mark does not move again,
+    // so only the task's own timer can charge it.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    publisher.funding.send_replace(Some(FundingView {
+        venue: Venue::Hyperliquid,
+        coin: "BTC".into(),
+        rate: dec!(0.0001),
+        settles_at: now + 2_000,
+    }));
+
+    let paid = tokio::time::timeout(WAIT, async {
+        loop {
+            if let Some(Event::Funding { amount, at, .. }) = events.recv().await {
+                return (amount, at);
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for funding");
+    assert_eq!(paid.0, dec!(-6));
+    assert!(paid.1 >= now + 2_000);
+    let view = handle.get(account.id).await.unwrap().unwrap();
+    assert_eq!(view.collateral, dec!(2_994));
+
+    shutdown.cancel();
+    task.await.unwrap();
 }

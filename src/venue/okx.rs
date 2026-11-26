@@ -1,7 +1,8 @@
 //! OKX connector for USDT-margined perpetual swaps.
 //!
 //! Subscribes to the `books` channel, which sends one 400-level snapshot per
-//! instrument followed by updates keyed by price, and to `mark-price`.
+//! instrument followed by updates keyed by price, and to `mark-price` and
+//! `funding-rate`.
 //! Every book message carries `seqId` and `prevSeqId`. An update is only
 //! applied if its `prevSeqId` is the `seqId` of the message before it, so a
 //! dropped message is detected instead of silently corrupting the book.
@@ -162,6 +163,15 @@ struct WireMark {
     mark_px: Decimal,
 }
 
+#[derive(Debug, Deserialize)]
+struct WireFunding {
+    #[serde(rename = "fundingRate")]
+    funding_rate: Decimal,
+    /// When this rate is charged, in milliseconds, as a string.
+    #[serde(rename = "fundingTime")]
+    funding_time: String,
+}
+
 /// A decoded frame. Book sizes are still in contracts here.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Event {
@@ -184,6 +194,11 @@ pub enum Event {
         inst_id: String,
         mark: Decimal,
     },
+    Funding {
+        inst_id: String,
+        rate: Decimal,
+        settles_at: u64,
+    },
     Pong,
     Subscribed,
     /// The venue reported an error.
@@ -196,7 +211,7 @@ pub enum Event {
 pub enum DecodeError {
     #[error("frame is not valid JSON for its channel: {0}")]
     Json(#[from] serde_json::Error),
-    #[error("book timestamp {0:?} is not a number")]
+    #[error("timestamp {0:?} is not a number")]
     Timestamp(String),
     #[error("{0} frame has no data")]
     Empty(&'static str),
@@ -264,6 +279,19 @@ pub fn decode(text: &str) -> Result<Event, DecodeError> {
             Ok(Event::Mark {
                 inst_id: arg.inst_id,
                 mark: mark.mark_px,
+            })
+        }
+        "funding-rate" => {
+            let [funding]: [WireFunding; 1] = serde_json::from_value(frame.data)
+                .map_err(|_| DecodeError::Empty("funding-rate"))?;
+            let settles_at = funding
+                .funding_time
+                .parse()
+                .map_err(|_| DecodeError::Timestamp(funding.funding_time.clone()))?;
+            Ok(Event::Funding {
+                inst_id: arg.inst_id,
+                rate: funding.funding_rate,
+                settles_at,
             })
         }
         other => Ok(Event::Ignored(other.to_string())),
@@ -402,8 +430,12 @@ async fn session(
 
     let inst_ids: Vec<&str> = tracked.keys().map(String::as_str).collect();
     if !inst_ids.is_empty() {
-        ws.send(request("subscribe", &["books", "mark-price"], &inst_ids))
-            .await?;
+        ws.send(request(
+            "subscribe",
+            &["books", "mark-price", "funding-rate"],
+            &inst_ids,
+        ))
+        .await?;
     }
 
     let mut mark_check = tokio::time::interval(MARK_CHECK_EVERY);
@@ -556,6 +588,16 @@ fn handle_text(
             }
             Vec::new()
         }
+        Event::Funding {
+            inst_id,
+            rate,
+            settles_at,
+        } => {
+            if let Some(state) = tracked.get_mut(&inst_id) {
+                state.market.set_funding(rate, settles_at);
+            }
+            Vec::new()
+        }
         Event::VenueError(message) => {
             warn!(venue = %VENUE, message, "venue reported an error");
             Vec::new()
@@ -615,6 +657,28 @@ mod tests {
                     px: dec!(60711.7),
                     sz: dec!(486.94)
                 }],
+            }
+        );
+    }
+
+    #[test]
+    fn decodes_funding() {
+        // Recorded from the live feed on 2026-11-26.
+        let frame = r#"{"arg":{"channel":"funding-rate","instId":"BTC-USDT-SWAP"},"data":[{
+            "formulaType":"withRate","fundingRate":"0.0000520660769816",
+            "fundingTime":"1795737600000","impactValue":"20000.0000000000000000",
+            "instId":"BTC-USDT-SWAP","instType":"SWAP","interestRate":"0.0001000000000000",
+            "maxFundingRate":"0.00375","method":"current_period","minFundingRate":"-0.00375",
+            "nextFundingRate":"","nextFundingTime":"1795766400000",
+            "premium":"-0.0004652068190741","prevFundingTime":"1795708800000",
+            "settFundingRate":"0.0000448840561709","settState":"settled",
+            "ts":"1795712949581"}]}"#;
+        assert_eq!(
+            decode(frame).unwrap(),
+            Event::Funding {
+                inst_id: "BTC-USDT-SWAP".into(),
+                rate: dec!(0.0000520660769816),
+                settles_at: 1_795_737_600_000,
             }
         );
     }

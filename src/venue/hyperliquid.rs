@@ -3,7 +3,7 @@
 //! Subscribes to the `l2` channel, which sends one full snapshot per market
 //! followed by diffs. Diffs normally arrive base64 encoded and compressed
 //! with raw DEFLATE. Also subscribes to `activeAssetCtx`, which carries the
-//! venue's mark price for one market.
+//! venue's mark price and funding rate for one market.
 //!
 //! The module has two halves. `decode` is pure: text frame in, `Event` out.
 //! `run` is the I/O loop: it owns the socket and the books, and it is the
@@ -110,7 +110,8 @@ struct WireUpdate {
     s: Decimal,
 }
 
-/// Payload of the `activeAssetCtx` channel. Only the mark price is read.
+/// Payload of the `activeAssetCtx` channel. The mark price and the funding
+/// rate are read.
 #[derive(Debug, Deserialize)]
 struct WireAssetCtx {
     coin: String,
@@ -121,6 +122,8 @@ struct WireAssetCtx {
 struct WireCtx {
     #[serde(rename = "markPx")]
     mark_px: Decimal,
+    #[serde(default)]
+    funding: Option<Decimal>,
 }
 
 /// A decoded frame, in terms the rest of the program understands.
@@ -141,6 +144,8 @@ pub enum Event {
     Mark {
         coin: String,
         mark: Decimal,
+        /// The rate for the current hour, if the frame carried one.
+        funding: Option<Decimal>,
     },
     Pong,
     Subscribed,
@@ -162,6 +167,21 @@ pub enum DecodeError {
     TooLarge,
 }
 
+/// Funding is paid every hour, on the hour.
+const FUNDING_EVERY_MS: u64 = 3_600_000;
+
+/// The first hour boundary after `now`, in milliseconds.
+pub fn next_hour(now: u64) -> u64 {
+    (now / FUNDING_EVERY_MS + 1) * FUNDING_EVERY_MS
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 /// Decodes one text frame.
 pub fn decode(text: &str) -> Result<Event, DecodeError> {
     let envelope: Envelope = serde_json::from_str(text)?;
@@ -179,6 +199,7 @@ pub fn decode(text: &str) -> Result<Event, DecodeError> {
             Ok(Event::Mark {
                 coin: ctx.coin,
                 mark: ctx.ctx.mark_px,
+                funding: ctx.ctx.funding,
             })
         }
         "pong" => Ok(Event::Pong),
@@ -455,9 +476,16 @@ fn handle_text(
                 }
             }
         }
-        Event::Mark { coin, mark } => {
+        Event::Mark {
+            coin,
+            mark,
+            funding,
+        } => {
             if let Some(market) = markets.get_mut(&coin) {
                 market.set_mark(mark, received);
+                if let Some(rate) = funding {
+                    market.set_funding(rate, next_hour(now_ms()));
+                }
             }
             Vec::new()
         }
@@ -576,9 +604,18 @@ mod tests {
             decode(frame).unwrap(),
             Event::Mark {
                 coin: "BTC".into(),
-                mark: dec!(60787.0)
+                mark: dec!(60787.0),
+                funding: Some(dec!(0.0000020754)),
             }
         );
+    }
+
+    #[test]
+    fn funding_settles_on_the_next_hour() {
+        assert_eq!(next_hour(0), 3_600_000);
+        assert_eq!(next_hour(3_599_999), 3_600_000);
+        // On the boundary the hour that just ended has settled.
+        assert_eq!(next_hour(3_600_000), 7_200_000);
     }
 
     #[test]

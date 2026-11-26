@@ -154,6 +154,16 @@ impl Engine {
                     .checked_add(*realized_pnl)
                     .ok_or(RiskError::Overflow)?;
             }
+            Event::Funding {
+                account, amount, ..
+            } => {
+                let entry = self.open_entry(*account)?;
+                entry.account.collateral = entry
+                    .account
+                    .collateral
+                    .checked_add(*amount)
+                    .ok_or(RiskError::Overflow)?;
+            }
             // A fault changed nothing when it happened.
             Event::Fault { account, .. } => {
                 self.entry(*account)?;
@@ -354,5 +364,26 @@ mod tests {
         let json = serde_json::to_string(&events).unwrap();
         let back: Vec<Event> = serde_json::from_str(&json).unwrap();
         assert_eq!(back, events);
+    }
+
+    #[test]
+    fn funding_payments_are_restored() {
+        let (schedule, thresholds) = parts();
+        let mut engine = Engine::new(schedule, thresholds);
+        engine.set_mark(btc(), Some(dec!(60_000)), 0);
+        let (id, mut events) = engine.create_account(dec!(30_000), 1).unwrap();
+        events.extend(engine.fill(id, btc(), Side::Long, dec!(1), 2).unwrap());
+        engine.set_funding(
+            btc(),
+            crate::engine::Funding {
+                rate: dec!(0.0001),
+                settles_at: 3,
+            },
+        );
+        events.extend(engine.settle_funding(3));
+        assert_eq!(events.last().unwrap().kind(), "funding");
+
+        let restored = restore(&events).unwrap();
+        assert_eq!(restored.view(id).unwrap().collateral, dec!(29_994));
     }
 }

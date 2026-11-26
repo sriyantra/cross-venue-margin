@@ -11,7 +11,7 @@ use tokio::time::Instant;
 use tracing::warn;
 
 use crate::book::Book;
-use crate::feed::{BookView, MarkView, Publisher};
+use crate::feed::{BookView, FundingView, MarkView, Publisher};
 use crate::risk::Venue;
 
 /// A mark price that has not been refreshed for this long is withdrawn.
@@ -85,6 +85,24 @@ impl Market {
         };
         self.publisher.mark.send_if_modified(|slot| {
             if slot.as_ref().is_some_and(|current| current.mark == mark) {
+                return false;
+            }
+            *slot = Some(view);
+            true
+        });
+    }
+
+    /// Publishes the rate the venue will charge at `settles_at`. Readers
+    /// are only woken when the rate or the time is different.
+    pub(crate) fn set_funding(&mut self, rate: Decimal, settles_at: u64) {
+        let view = FundingView {
+            venue: self.venue,
+            coin: self.book.coin().to_string(),
+            rate,
+            settles_at,
+        };
+        self.publisher.funding.send_if_modified(|slot| {
+            if slot.as_ref() == Some(&view) {
                 return false;
             }
             *slot = Some(view);

@@ -95,6 +95,16 @@ pub enum Event {
         realized_pnl: Decimal,
         at: u64,
     },
+    /// A funding payment on one position. `amount` is the change to the
+    /// dollar balance: negative when the account paid.
+    Funding {
+        account: AccountId,
+        #[serde(flatten)]
+        market: MarketId,
+        rate: Decimal,
+        amount: Decimal,
+        at: u64,
+    },
     /// The account's risk could not be computed. Its state was left alone.
     Fault {
         account: AccountId,
@@ -111,6 +121,7 @@ impl Event {
             | Event::Filled { account, .. }
             | Event::StateChanged { account, .. }
             | Event::Liquidated { account, .. }
+            | Event::Funding { account, .. }
             | Event::Fault { account, .. } => *account,
         }
     }
@@ -123,6 +134,7 @@ impl Event {
             | Event::Filled { at, .. }
             | Event::StateChanged { at, .. }
             | Event::Liquidated { at, .. }
+            | Event::Funding { at, .. }
             | Event::Fault { at, .. } => *at,
         }
     }
@@ -135,6 +147,7 @@ impl Event {
             Event::Filled { .. } => "filled",
             Event::StateChanged { .. } => "state_changed",
             Event::Liquidated { .. } => "liquidated",
+            Event::Funding { .. } => "funding",
             Event::Fault { .. } => "fault",
         }
     }
@@ -223,6 +236,18 @@ pub struct PositionView {
     pub mark: Option<Decimal>,
     pub unrealized_pnl: Option<Decimal>,
     pub liquidation_price: Option<LiquidationPrice>,
+    /// The rate the venue will charge at its next funding settlement, and
+    /// when that is. A positive rate is paid by longs.
+    pub funding: Option<Funding>,
+}
+
+/// A funding rate and the time it is charged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct Funding {
+    /// The share of a position's notional a long pays a short.
+    pub rate: Decimal,
+    /// Milliseconds since the epoch.
+    pub settles_at: u64,
 }
 
 struct Entry {
@@ -235,6 +260,8 @@ pub struct Engine {
     thresholds: Thresholds,
     marks: Marks,
     depths: Depths,
+    /// The next funding settlement of each market that has one coming.
+    fundings: BTreeMap<MarketId, Funding>,
     accounts: BTreeMap<AccountId, Entry>,
     next_id: u64,
 }
@@ -246,6 +273,7 @@ impl Engine {
             thresholds,
             marks: Marks::new(),
             depths: Depths::new(),
+            fundings: BTreeMap::new(),
             accounts: BTreeMap::new(),
             next_id: 1,
         }
@@ -328,6 +356,82 @@ impl Engine {
             Some(book) => self.depths.insert(market, book),
             None => self.depths.remove(&market),
         };
+    }
+
+    /// Records the rate a venue will charge at its next funding
+    /// settlement, replacing the one held for that market.
+    ///
+    /// Call `settle_funding` first. A venue announces its next settlement
+    /// only after the last one has passed, so replacing a settlement that
+    /// is already due would lose it.
+    pub fn set_funding(&mut self, market: MarketId, funding: Funding) {
+        self.fundings.insert(market, funding);
+    }
+
+    /// Charges every funding settlement that has come due.
+    ///
+    /// Each position in a settling market pays `size * mark * rate` if it
+    /// is long and receives it if it is short. A negative rate reverses
+    /// that. The payment moves the dollar balance, and the account is
+    /// re-evaluated like after any other loss or gain.
+    ///
+    /// A settlement is charged once. One that comes due while its market
+    /// has no mark is dropped, because there is no price to charge it at.
+    pub fn settle_funding(&mut self, now: u64) -> Vec<Event> {
+        let due: Vec<(MarketId, Funding)> = self
+            .fundings
+            .iter()
+            .filter(|(_, funding)| funding.settles_at <= now)
+            .map(|(market, funding)| (market.clone(), *funding))
+            .collect();
+        let mut events = Vec::new();
+        for (market, funding) in due {
+            self.fundings.remove(&market);
+            let Some(&mark) = self.marks.get(&market) else {
+                continue;
+            };
+            for (&id, entry) in self.accounts.iter_mut() {
+                let Some(position) = entry.account.position(&market) else {
+                    continue;
+                };
+                let amount = position
+                    .size()
+                    .checked_mul(mark)
+                    .and_then(|notional| notional.checked_mul(funding.rate))
+                    .map(|payment| -(payment * position.side().sign()));
+                let balance = amount.and_then(|a| entry.account.collateral.checked_add(a));
+                let (Some(amount), Some(balance)) = (amount, balance) else {
+                    events.push(Event::Fault {
+                        account: id,
+                        error: RiskError::Overflow.to_string(),
+                        at: now,
+                    });
+                    continue;
+                };
+                if amount.is_zero() {
+                    continue;
+                }
+                entry.account.collateral = balance;
+                events.push(Event::Funding {
+                    account: id,
+                    market: market.clone(),
+                    rate: funding.rate,
+                    amount,
+                    at: now,
+                });
+                reassess(
+                    id,
+                    entry,
+                    &self.marks,
+                    &self.depths,
+                    &self.schedule,
+                    &self.thresholds,
+                    now,
+                    &mut events,
+                );
+            }
+        }
+        events
     }
 
     /// Fills a paper order.
@@ -564,6 +668,7 @@ impl Engine {
                         &self.schedule,
                     )
                     .ok(),
+                    funding: self.fundings.get(market).copied(),
                 }
             })
             .collect();
@@ -1362,5 +1467,112 @@ mod tests {
                 "side": "long", "size": "0.5", "px": "60000", "realized_pnl": "0", "at": 7
             })
         );
+    }
+    fn funding(rate: Decimal, settles_at: u64) -> Funding {
+        Funding { rate, settles_at }
+    }
+
+    #[test]
+    fn a_long_pays_positive_funding_and_a_short_receives_it() {
+        let (mut engine, long) = long_btc();
+        let (short, _) = engine.create_account(dec!(3_000), 3).unwrap();
+        engine
+            .fill(short, market("BTC"), Side::Short, dec!(0.5), 4)
+            .unwrap();
+        engine.set_funding(market("BTC"), funding(dec!(0.0001), 100));
+
+        // Nothing is charged before the settlement time.
+        assert!(engine.settle_funding(99).is_empty());
+        assert_eq!(
+            engine.view(long).unwrap().positions[0].funding,
+            Some(funding(dec!(0.0001), 100))
+        );
+
+        // 1 BTC at 60,000 pays 6. Half a BTC short receives 3.
+        let events = engine.settle_funding(100);
+        assert_eq!(
+            events,
+            vec![
+                Event::Funding {
+                    account: long,
+                    market: market("BTC"),
+                    rate: dec!(0.0001),
+                    amount: dec!(-6),
+                    at: 100,
+                },
+                Event::Funding {
+                    account: short,
+                    market: market("BTC"),
+                    rate: dec!(0.0001),
+                    amount: dec!(3),
+                    at: 100,
+                },
+            ]
+        );
+        assert_eq!(engine.view(long).unwrap().collateral, dec!(2_994));
+        assert_eq!(engine.view(short).unwrap().collateral, dec!(3_003));
+
+        // A settlement is charged once.
+        assert!(engine.settle_funding(200).is_empty());
+        assert_eq!(engine.view(long).unwrap().positions[0].funding, None);
+    }
+
+    #[test]
+    fn negative_funding_pays_the_long() {
+        let (mut engine, id) = long_btc();
+        engine.set_funding(market("BTC"), funding(dec!(-0.0002), 10));
+        engine.settle_funding(10);
+        assert_eq!(engine.view(id).unwrap().collateral, dec!(3_012));
+    }
+
+    #[test]
+    fn funding_uses_the_mark_at_settlement() {
+        let (mut engine, id) = long_btc();
+        engine.set_funding(market("BTC"), funding(dec!(0.0001), 10));
+        engine.set_mark(market("BTC"), Some(dec!(61_000)), 5);
+        engine.settle_funding(10);
+        assert_eq!(engine.view(id).unwrap().collateral, dec!(2_993.9));
+    }
+
+    #[test]
+    fn funding_without_a_mark_is_dropped() {
+        let (mut engine, id) = long_btc();
+        engine.set_funding(market("BTC"), funding(dec!(0.0001), 10));
+        engine.set_mark(market("BTC"), None, 5);
+        assert!(engine.settle_funding(10).is_empty());
+        engine.set_mark(market("BTC"), Some(dec!(60_000)), 11);
+        assert!(engine.settle_funding(12).is_empty());
+        assert_eq!(engine.view(id).unwrap().collateral, dec!(3_000));
+    }
+
+    #[test]
+    fn funding_can_liquidate_an_account() {
+        // Maintenance on 1 BTC at 60,000 is 750. A payment of 2,400 leaves
+        // 600 of equity.
+        let (mut engine, id) = long_btc();
+        engine.set_funding(market("BTC"), funding(dec!(0.04), 10));
+        let events = engine.settle_funding(10);
+        assert!(matches!(events[0], Event::Funding { amount, .. } if amount == dec!(-2_400)));
+        assert!(events.iter().any(|e| matches!(e, Event::Liquidated { .. })));
+        assert!(matches!(
+            engine.view(id).unwrap().state,
+            AccountState::Closed { .. }
+        ));
+    }
+
+    #[test]
+    fn a_hedged_pair_at_one_rate_and_mark_nets_to_zero() {
+        let mut engine = two_venue_engine();
+        engine.set_mark(market("BTC"), Some(dec!(60_000)), 0);
+        engine.set_mark(okx_btc(), Some(dec!(60_000)), 0);
+        let (id, _) = engine.create_account(dec!(10_000), 1).unwrap();
+        engine
+            .fill(id, market("BTC"), Side::Long, dec!(1), 2)
+            .unwrap();
+        engine.fill(id, okx_btc(), Side::Short, dec!(1), 3).unwrap();
+        engine.set_funding(market("BTC"), funding(dec!(0.0001), 10));
+        engine.set_funding(okx_btc(), funding(dec!(0.0001), 10));
+        assert_eq!(engine.settle_funding(10).len(), 2);
+        assert_eq!(engine.view(id).unwrap().collateral, dec!(10_000));
     }
 }

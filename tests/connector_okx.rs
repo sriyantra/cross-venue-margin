@@ -126,6 +126,7 @@ async fn expect_subscriptions(venue: &mut FakeVenue) {
         json!([
             { "channel": "books", "instId": INST },
             { "channel": "mark-price", "instId": INST },
+            { "channel": "funding-rate", "instId": INST },
         ])
     );
 }

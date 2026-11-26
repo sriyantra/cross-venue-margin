@@ -128,6 +128,7 @@ async fn start(order_reply: Value) -> Harness {
         engine,
         marks,
         Vec::new(),
+        Vec::new(),
         command_rx,
         event_tx,
         Metrics::new(),

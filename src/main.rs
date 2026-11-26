@@ -142,6 +142,10 @@ async fn main() -> Result<()> {
         .book_receivers()
         .map(|(market, rx)| (market.clone(), rx))
         .collect();
+    let fundings = feeds
+        .funding_receivers()
+        .map(|(market, rx)| (market.clone(), rx))
+        .collect();
     let (command_tx, command_rx) = mpsc::channel(COMMAND_QUEUE);
     let (event_tx, event_rx) = mpsc::channel(EVENT_QUEUE);
 
@@ -185,6 +189,7 @@ async fn main() -> Result<()> {
         engine,
         marks,
         books,
+        fundings,
         command_rx,
         event_tx,
         metrics.clone(),

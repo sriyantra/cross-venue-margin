@@ -6,15 +6,15 @@
 //! a slow consumer slows the engine down instead of losing an event.
 
 use std::collections::BTreeMap;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rust_decimal::Decimal;
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 
-use super::{AccountId, AccountView, Engine, EngineError, Event};
-use crate::feed::{BookRx, MarkRx};
+use super::{AccountId, AccountView, Engine, EngineError, Event, Funding};
+use crate::feed::{BookRx, FundingRx, MarkRx};
 use crate::metrics::Metrics;
 use crate::risk::{MarketId, Side, Venue};
 
@@ -200,11 +200,17 @@ async fn any_mark_changed(marks: &mut [Watched]) {
     let _ = futures_util::future::select_all(waits).await;
 }
 
+/// How often the task wakes with nothing else to do, so that a funding
+/// settlement is charged on time in a market whose mark is not moving.
+const FUNDING_CHECK_EVERY: Duration = Duration::from_secs(1);
+
 /// Runs the engine until `shutdown` is cancelled or every handle is dropped.
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     mut engine: Engine,
     marks: Vec<(MarketId, MarkRx)>,
     books: Vec<(MarketId, BookRx)>,
+    fundings: Vec<(MarketId, FundingRx)>,
     mut commands: mpsc::Receiver<Command>,
     events: mpsc::Sender<Event>,
     metrics: Metrics,
@@ -219,6 +225,9 @@ pub async fn run(
         })
         .collect();
 
+    let mut funding_check = tokio::time::interval(FUNDING_CHECK_EVERY);
+    funding_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
     'run: loop {
         let command = tokio::select! {
             _ = shutdown.cancelled() => break,
@@ -227,6 +236,7 @@ pub async fn run(
                 None => break,
             },
             _ = any_mark_changed(&mut marks) => None,
+            _ = funding_check.tick() => None,
         };
         let now = now_ms();
         let mut out = Vec::new();
@@ -275,6 +285,20 @@ pub async fn run(
             }
             !closed
         });
+
+        // Settlements that are due are charged at the marks just applied.
+        // Only then are the venues' next settlements read, because a venue
+        // announces the next one after the last has passed.
+        out.extend(engine.settle_funding(now));
+        for (market, rx) in &fundings {
+            let next = rx.borrow().as_ref().map(|view| Funding {
+                rate: view.rate,
+                settles_at: view.settles_at,
+            });
+            if let Some(next) = next.filter(|next| next.settles_at > now) {
+                engine.set_funding(market.clone(), next);
+            }
+        }
 
         if let Some(command) = command {
             out.extend(handle(&mut engine, command, now));

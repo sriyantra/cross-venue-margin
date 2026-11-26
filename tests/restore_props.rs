@@ -4,7 +4,7 @@
 
 use std::collections::BTreeMap;
 
-use cross_venue_margin::engine::{AccountId, Engine, Event};
+use cross_venue_margin::engine::{AccountId, Engine, Event, Funding};
 use cross_venue_margin::risk::{
     CollateralRule, MarketId, Schedule, Side, SizeTable, Thresholds, TierTable, Venue,
 };
@@ -52,6 +52,8 @@ enum Op {
     },
     /// `None` withdraws the mark.
     Mark(usize, Option<Decimal>),
+    /// A funding settlement in one market, at this rate.
+    Funding(usize, Decimal),
 }
 
 /// Marks stay within 20% of 100, close enough for leveraged accounts to be
@@ -74,6 +76,8 @@ fn op() -> impl Strategy<Value = Op> {
         4 => (0usize..2, 8_000i64..=12_000)
             .prop_map(|(market, cents)| Op::Mark(market, Some(Decimal::new(cents, 2)))),
         1 => (0usize..2).prop_map(|market| Op::Mark(market, None)),
+        2 => (0usize..2, -500i64..=500)
+            .prop_map(|(market, units)| Op::Funding(market, Decimal::new(units, 5))),
     ]
 }
 
@@ -132,6 +136,16 @@ fn run(ops: &[Op]) -> Run {
                 if let Ok(events) = run.engine.fill(*id, market, *side, *size, now) {
                     run.events.extend(events);
                 }
+            }
+            Op::Funding(market, rate) => {
+                run.engine.set_funding(
+                    markets()[*market].clone(),
+                    Funding {
+                        rate: *rate,
+                        settles_at: now,
+                    },
+                );
+                run.events.extend(run.engine.settle_funding(now));
             }
             Op::Mark(market, mark) => {
                 let market = markets()[*market].clone();

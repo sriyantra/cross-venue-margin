@@ -1,8 +1,8 @@
 //! The hand-off between venue connectors and everything that reads books
 //! and mark prices.
 //!
-//! Each market gets two `tokio::sync::watch` channels, one for its book and
-//! one for its mark price. A watch channel holds a single value, the latest
+//! Each market gets three `tokio::sync::watch` channels: its book, its mark
+//! price, and its funding rate. A watch channel holds a single value, the latest
 //! one. The connector overwrites it after every applied message, and any
 //! number of readers can look at the current value or wait for the next
 //! change. A slow reader never builds a queue: it just skips straight to the
@@ -71,11 +71,29 @@ pub type MarkSlot = Option<MarkView>;
 pub type MarkTx = watch::Sender<MarkSlot>;
 pub type MarkRx = watch::Receiver<MarkSlot>;
 
+/// The funding rate a venue will charge at its next settlement.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct FundingView {
+    pub venue: Venue,
+    pub coin: String,
+    /// The share of a position's notional a long pays a short at the
+    /// settlement. Negative when shorts pay longs.
+    pub rate: Decimal,
+    /// When the venue settles, in milliseconds since the epoch.
+    pub settles_at: u64,
+}
+
+/// `None` until the venue has sent a rate.
+pub type FundingSlot = Option<FundingView>;
+pub type FundingTx = watch::Sender<FundingSlot>;
+pub type FundingRx = watch::Receiver<FundingSlot>;
+
 /// Write side for one market, owned by that market's venue connector.
 #[derive(Debug)]
 pub struct Publisher {
     pub book: BookTx,
     pub mark: MarkTx,
+    pub funding: FundingTx,
 }
 
 /// Write sides for every market, grouped by the venue whose connector will
@@ -98,6 +116,7 @@ impl Publishers {
 pub struct Feeds {
     books: BTreeMap<MarketId, BookRx>,
     marks: BTreeMap<MarketId, MarkRx>,
+    fundings: BTreeMap<MarketId, FundingRx>,
 }
 
 impl Feeds {
@@ -109,13 +128,18 @@ impl Feeds {
         for market in markets {
             let (book, book_rx) = watch::channel(None);
             let (mark, mark_rx) = watch::channel(None);
-            publishers
-                .by_venue
-                .entry(market.venue)
-                .or_default()
-                .insert(market.coin.clone(), Publisher { book, mark });
+            let (funding, funding_rx) = watch::channel(None);
+            publishers.by_venue.entry(market.venue).or_default().insert(
+                market.coin.clone(),
+                Publisher {
+                    book,
+                    mark,
+                    funding,
+                },
+            );
             feeds.books.insert(market.clone(), book_rx);
             feeds.marks.insert(market.clone(), mark_rx);
+            feeds.fundings.insert(market.clone(), funding_rx);
         }
         (feeds, publishers)
     }
@@ -139,6 +163,17 @@ impl Feeds {
     /// Every market's mark receiver, for a task that watches all of them.
     pub fn mark_receivers(&self) -> impl Iterator<Item = (&MarketId, MarkRx)> {
         self.marks.iter().map(|(market, rx)| (market, rx.clone()))
+    }
+
+    pub fn latest_funding(&self, market: &MarketId) -> Option<FundingSlot> {
+        self.fundings.get(market).map(|rx| rx.borrow().clone())
+    }
+
+    /// Every market's funding receiver, for a task that reads all of them.
+    pub fn funding_receivers(&self) -> impl Iterator<Item = (&MarketId, FundingRx)> {
+        self.fundings
+            .iter()
+            .map(|(market, rx)| (market, rx.clone()))
     }
 
     /// Every market's book receiver, for a task that reads all of them.
