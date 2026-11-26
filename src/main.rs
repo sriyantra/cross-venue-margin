@@ -2,6 +2,7 @@ use anyhow::Result;
 use cross_venue_margin::config::{self, Config};
 use cross_venue_margin::engine::task::{self, EngineHandle};
 use cross_venue_margin::engine::{Engine, Event};
+use cross_venue_margin::execution::{self, Close, Executor};
 use cross_venue_margin::feed::Feeds;
 use cross_venue_margin::metrics::Metrics;
 use cross_venue_margin::risk::{
@@ -9,6 +10,8 @@ use cross_venue_margin::risk::{
 };
 use cross_venue_margin::store::{self, EventStore};
 use cross_venue_margin::{server, venue};
+use std::sync::Arc;
+
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
@@ -25,6 +28,24 @@ async fn log_events(mut events: mpsc::Receiver<Event>) {
         match serde_json::to_string(&event) {
             Ok(json) => info!(event = %json, "engine event"),
             Err(error) => warn!(%error, "event did not serialize"),
+        }
+    }
+}
+
+/// Passes every engine event on to the log, and asks for a close on the
+/// venue for each position the engine liquidates. It never waits on the
+/// venue, so the log is not held up by it.
+async fn forward_events(
+    mut from: mpsc::Receiver<Event>,
+    to: mpsc::Sender<Event>,
+    closes: mpsc::UnboundedSender<Close>,
+) {
+    while let Some(event) = from.recv().await {
+        if let Some(close) = Close::from_event(&event) {
+            let _ = closes.send(close);
+        }
+        if to.send(event).await.is_err() {
+            break;
         }
     }
 }
@@ -124,6 +145,30 @@ async fn main() -> Result<()> {
     let (command_tx, command_rx) = mpsc::channel(COMMAND_QUEUE);
     let (event_tx, event_rx) = mpsc::channel(EVENT_QUEUE);
 
+    let executor = match &config.hl_testnet_key {
+        Some(key) => {
+            let executor = Executor::connect(execution::TESTNET_API, key.expose()).await?;
+            info!(
+                address = executor.address(),
+                "Hyperliquid fills are orders on testnet"
+            );
+            Some(Arc::new(executor))
+        }
+        None => None,
+    };
+    // With an executor, events pass through a task that also asks for
+    // liquidated positions to be closed on the venue.
+    let (event_rx, venue_tasks) = match &executor {
+        Some(executor) => {
+            let (log_tx, log_rx) = mpsc::channel(EVENT_QUEUE);
+            let (close_tx, close_rx) = mpsc::unbounded_channel();
+            let forward = tokio::spawn(forward_events(event_rx, log_tx, close_tx));
+            let closes = tokio::spawn(execution::run_closes(executor.clone(), close_rx));
+            (log_rx, Some((forward, closes)))
+        }
+        None => (event_rx, None),
+    };
+
     let hyperliquid = tokio::spawn(venue::hyperliquid::run(
         config.hl_ws_url.clone(),
         publishers.take(Venue::Hyperliquid),
@@ -160,6 +205,7 @@ async fn main() -> Result<()> {
         EngineHandle::new(command_tx),
         metrics,
         config.read_only,
+        executor,
         shutdown.clone(),
     ));
 
@@ -170,6 +216,10 @@ async fn main() -> Result<()> {
     hyperliquid.await?;
     okx.await?;
     risk.await?;
+    if let Some((forward, closes)) = venue_tasks {
+        forward.await?;
+        closes.await?;
+    }
     event_log.await?;
     api.await??;
     Ok(())

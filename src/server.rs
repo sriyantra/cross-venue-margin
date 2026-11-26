@@ -7,12 +7,17 @@
 //! - `POST /accounts`             open a paper account
 //! - `GET /accounts/{id}`         health, state and positions
 //! - `POST /accounts/{id}/deposits`  add collateral: dollars or a coin
-//! - `POST /accounts/{id}/fills`  fill a paper order at the mark
+//! - `POST /accounts/{id}/fills`  fill an order: on paper, or on testnet
+//! - `GET /venues/hyperliquid/reconciliation`  engine against the wallet
 //! - `GET /metrics`              process metrics for a Prometheus scraper
 //!
 //! Market data handlers only read from watch channels. They never touch a
 //! `Book`. Account handlers send a command to the engine task and wait for
 //! its reply. They never touch an account.
+//!
+//! With an `Executor`, a fill on a Hyperliquid market is sent to the
+//! venue's testnet between two engine commands: one that checks it and one
+//! that records what the venue filled. The engine never waits on the venue.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -30,7 +35,8 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
 
 use crate::engine::task::EngineHandle;
-use crate::engine::{AccountId, EngineError};
+use crate::engine::{AccountId, AccountView, EngineError};
+use crate::execution::{ExecutionError, Executor};
 use crate::feed::{BookRx, BookView, Feeds, MarkView, Slot};
 use crate::metrics::{self, Metrics};
 use crate::risk::{MarketId, Side, Venue};
@@ -42,6 +48,13 @@ struct AppState {
     feeds: Arc<Feeds>,
     engine: EngineHandle,
     metrics: Metrics,
+    executor: Option<Arc<Executor>>,
+}
+
+impl FromRef<AppState> for Option<Arc<Executor>> {
+    fn from_ref(state: &AppState) -> Self {
+        state.executor.clone()
+    }
 }
 
 impl FromRef<AppState> for Arc<Feeds> {
@@ -142,8 +155,15 @@ struct Health {
 }
 
 /// With `read_only` set, the routes that change an account answer 403 and
-/// never reach the engine.
-pub fn router(feeds: Feeds, engine: EngineHandle, metrics: Metrics, read_only: bool) -> Router {
+/// never reach the engine. With an `executor`, fills on Hyperliquid markets
+/// are sent to the venue's testnet.
+pub fn router(
+    feeds: Feeds,
+    engine: EngineHandle,
+    metrics: Metrics,
+    read_only: bool,
+    executor: Option<Arc<Executor>>,
+) -> Router {
     let writes = if read_only {
         Router::new()
             .route("/accounts", post(refuse_write))
@@ -162,11 +182,13 @@ pub fn router(feeds: Feeds, engine: EngineHandle, metrics: Metrics, read_only: b
         .route("/ws/{venue}/{coin}", get(ws_upgrade))
         .route("/accounts/{id}", get(account))
         .route("/metrics", get(render_metrics))
+        .route("/venues/hyperliquid/reconciliation", get(reconciliation))
         .merge(writes)
         .with_state(AppState {
             feeds: Arc::new(feeds),
             engine,
             metrics,
+            executor,
         })
 }
 
@@ -177,13 +199,17 @@ pub async fn serve(
     engine: EngineHandle,
     metrics: Metrics,
     read_only: bool,
+    executor: Option<Arc<Executor>>,
     shutdown: CancellationToken,
 ) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(bind).await?;
     info!(addr = %listener.local_addr()?, read_only, "api listening");
-    axum::serve(listener, router(feeds, engine, metrics, read_only))
-        .with_graceful_shutdown(async move { shutdown.cancelled().await })
-        .await?;
+    axum::serve(
+        listener,
+        router(feeds, engine, metrics, read_only, executor),
+    )
+    .with_graceful_shutdown(async move { shutdown.cancelled().await })
+    .await?;
     Ok(())
 }
 
@@ -317,19 +343,155 @@ async fn deposit(
     }
 }
 
+fn execution_error(error: ExecutionError) -> Response {
+    let status = match &error {
+        ExecutionError::UnknownCoin(_)
+        | ExecutionError::InvalidSize { .. }
+        | ExecutionError::InvalidPrice(_) => StatusCode::BAD_REQUEST,
+        ExecutionError::Rejected(_) | ExecutionError::NotFilled => StatusCode::CONFLICT,
+        ExecutionError::Transport(_) | ExecutionError::Reply(_) => StatusCode::BAD_GATEWAY,
+        ExecutionError::Sign(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    let body = ErrorBody {
+        error: error.to_string(),
+    };
+    (status, Json(body)).into_response()
+}
+
+/// Why a fill did not happen: the engine refused it, or the venue did.
+enum FillError {
+    Engine(EngineError),
+    Venue(ExecutionError),
+}
+
+impl IntoResponse for FillError {
+    fn into_response(self) -> Response {
+        match self {
+            FillError::Engine(error) => engine_error(error),
+            FillError::Venue(error) => execution_error(error),
+        }
+    }
+}
+
+/// Sends an order to the venue and records what it filled.
+///
+/// The engine is asked first whether it would accept the fill, so an order
+/// the account cannot carry never reaches the venue. Once the venue has
+/// filled, the fill is recorded whatever the account looks like by then.
+async fn execute(
+    engine: &EngineHandle,
+    executor: &Executor,
+    account: AccountId,
+    market: MarketId,
+    side: Side,
+    size: Decimal,
+) -> Result<AccountView, FillError> {
+    let _turn = executor.turn().await;
+    let reference = engine
+        .check_fill(account, market.clone(), side, size)
+        .await
+        .map_err(FillError::Engine)?;
+    let done = executor
+        .market_order(&market.coin, side, size, reference)
+        .await
+        .map_err(FillError::Venue)?;
+    engine
+        .record_fill(account, market, side, done.size, done.px)
+        .await
+        .map_err(FillError::Engine)
+}
+
 async fn fill(
     State(engine): State<EngineHandle>,
+    State(executor): State<Option<Arc<Executor>>>,
     Path(id): Path<u64>,
     Json(body): Json<FillRequest>,
 ) -> Response {
     let market = MarketId::new(body.venue, body.coin);
-    match engine
-        .fill(AccountId(id), market, body.side, body.size)
-        .await
-    {
+    let result = match executor {
+        Some(executor) if market.venue == Venue::Hyperliquid => {
+            execute(
+                &engine,
+                &executor,
+                AccountId(id),
+                market,
+                body.side,
+                body.size,
+            )
+            .await
+        }
+        _ => engine
+            .fill(AccountId(id), market, body.side, body.size)
+            .await
+            .map_err(FillError::Engine),
+    };
+    match result {
         Ok(view) => Json(view).into_response(),
-        Err(error) => engine_error(error),
+        Err(error) => error.into_response(),
     }
+}
+
+#[derive(Serialize)]
+struct CoinReconciliation {
+    coin: String,
+    /// The sum of every account's position in the coin, longs positive.
+    engine: Decimal,
+    /// The wallet's position on the venue.
+    venue: Decimal,
+    difference: Decimal,
+}
+
+#[derive(Serialize)]
+struct Reconciliation {
+    address: String,
+    account_value: Decimal,
+    /// True when the wallet holds exactly what the accounts add up to.
+    matched: bool,
+    coins: Vec<CoinReconciliation>,
+}
+
+/// Compares the positions the engine has recorded on Hyperliquid with the
+/// positions the wallet holds on the venue.
+async fn reconciliation(
+    State(engine): State<EngineHandle>,
+    State(executor): State<Option<Arc<Executor>>>,
+) -> Response {
+    let Some(executor) = executor else {
+        let body = ErrorBody {
+            error: "no venue account is configured".into(),
+        };
+        return (StatusCode::NOT_FOUND, Json(body)).into_response();
+    };
+    let recorded = match engine.net_positions(Venue::Hyperliquid).await {
+        Ok(recorded) => recorded,
+        Err(error) => return engine_error(error),
+    };
+    let held = match executor.account().await {
+        Ok(held) => held,
+        Err(error) => return execution_error(error),
+    };
+    let names: std::collections::BTreeSet<&String> =
+        recorded.keys().chain(held.positions.keys()).collect();
+    let coins: Vec<CoinReconciliation> = names
+        .into_iter()
+        .map(|coin| {
+            let engine = recorded.get(coin).copied().unwrap_or(Decimal::ZERO);
+            let venue = held.positions.get(coin).copied().unwrap_or(Decimal::ZERO);
+            CoinReconciliation {
+                coin: coin.clone(),
+                engine,
+                venue,
+                difference: (venue - engine).normalize(),
+            }
+        })
+        .collect();
+    Json(Reconciliation {
+        address: executor.address(),
+        account_value: held.account_value,
+        matched: coins.iter().all(|coin| coin.difference.is_zero()),
+        coins,
+    })
+    .into_response()
 }
 
 async fn ws_upgrade(

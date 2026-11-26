@@ -5,6 +5,8 @@ use std::net::SocketAddr;
 use anyhow::{Context, Result, bail};
 use rust_decimal::Decimal;
 
+use crate::execution::TESTNET_WS;
+
 /// A value that must not reach the log. Its `Debug` output hides it.
 #[derive(Clone)]
 pub struct Secret(String);
@@ -23,8 +25,13 @@ impl std::fmt::Debug for Secret {
 
 #[derive(Debug, Clone)]
 pub struct Config {
-    /// Hyperliquid WebSocket endpoint.
+    /// Hyperliquid WebSocket endpoint. Testnet's when `hl_testnet_key` is
+    /// set, so that orders are checked against the book they will meet.
     pub hl_ws_url: String,
+    /// Private key of a Hyperliquid testnet wallet. With it, fills on
+    /// Hyperliquid markets are real orders on testnet. Without it every
+    /// fill is on paper.
+    pub hl_testnet_key: Option<Secret>,
     /// OKX public WebSocket endpoint.
     pub okx_ws_url: String,
     /// Coins to track on every venue that lists them (for example `BTC`).
@@ -47,8 +54,18 @@ pub struct Config {
 
 impl Config {
     pub fn from_env() -> Result<Self> {
-        let hl_ws_url =
-            std::env::var("HL_WS_URL").unwrap_or_else(|_| "wss://api.hyperliquid.xyz/ws".into());
+        let hl_testnet_key = std::env::var("HL_TESTNET_KEY")
+            .ok()
+            .filter(|key| !key.is_empty())
+            .map(Secret);
+        let hl_ws_url = match (std::env::var("HL_WS_URL"), &hl_testnet_key) {
+            (Ok(_), Some(_)) => {
+                bail!("HL_WS_URL cannot be set with HL_TESTNET_KEY, which selects testnet")
+            }
+            (Ok(url), None) => url,
+            (Err(_), Some(_)) => TESTNET_WS.into(),
+            (Err(_), None) => "wss://api.hyperliquid.xyz/ws".into(),
+        };
 
         let okx_ws_url = std::env::var("OKX_WS_URL")
             .unwrap_or_else(|_| "wss://ws.okx.com:443/ws/v5/public".into());
@@ -99,6 +116,7 @@ impl Config {
 
         Ok(Self {
             hl_ws_url,
+            hl_testnet_key,
             okx_ws_url,
             coins,
             bind,

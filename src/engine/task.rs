@@ -5,6 +5,7 @@
 //! arrive through watch channels. Events leave through a bounded channel, so
 //! a slow consumer slows the engine down instead of losing an event.
 
+use std::collections::BTreeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rust_decimal::Decimal;
@@ -15,7 +16,7 @@ use tracing::info;
 use super::{AccountId, AccountView, Engine, EngineError, Event};
 use crate::feed::{BookRx, MarkRx};
 use crate::metrics::Metrics;
-use crate::risk::{MarketId, Side};
+use crate::risk::{MarketId, Side, Venue};
 
 type Reply<T> = oneshot::Sender<T>;
 
@@ -38,9 +39,31 @@ pub enum Command {
         size: Decimal,
         reply: Reply<Result<AccountView, EngineError>>,
     },
+    /// Asks whether a fill would be accepted, and at what price, without
+    /// applying it.
+    CheckFill {
+        account: AccountId,
+        market: MarketId,
+        side: Side,
+        size: Decimal,
+        reply: Reply<Result<Decimal, EngineError>>,
+    },
+    /// Records a fill a venue has already made.
+    RecordFill {
+        account: AccountId,
+        market: MarketId,
+        side: Side,
+        size: Decimal,
+        px: Decimal,
+        reply: Reply<Result<AccountView, EngineError>>,
+    },
     Get {
         account: AccountId,
         reply: Reply<Option<AccountView>>,
+    },
+    NetPositions {
+        venue: Venue,
+        reply: Reply<BTreeMap<String, Decimal>>,
     },
 }
 
@@ -104,8 +127,52 @@ impl EngineHandle {
         .await?
     }
 
+    pub async fn check_fill(
+        &self,
+        account: AccountId,
+        market: MarketId,
+        side: Side,
+        size: Decimal,
+    ) -> Result<Decimal, EngineError> {
+        self.request(|reply| Command::CheckFill {
+            account,
+            market,
+            side,
+            size,
+            reply,
+        })
+        .await?
+    }
+
+    pub async fn record_fill(
+        &self,
+        account: AccountId,
+        market: MarketId,
+        side: Side,
+        size: Decimal,
+        px: Decimal,
+    ) -> Result<AccountView, EngineError> {
+        self.request(|reply| Command::RecordFill {
+            account,
+            market,
+            side,
+            size,
+            px,
+            reply,
+        })
+        .await?
+    }
+
     pub async fn get(&self, account: AccountId) -> Result<Option<AccountView>, EngineError> {
         self.request(|reply| Command::Get { account, reply }).await
+    }
+
+    pub async fn net_positions(
+        &self,
+        venue: Venue,
+    ) -> Result<BTreeMap<String, Decimal>, EngineError> {
+        self.request(|reply| Command::NetPositions { venue, reply })
+            .await
     }
 }
 
@@ -280,8 +347,42 @@ fn handle(engine: &mut Engine, command: Command, now: u64) -> Vec<Event> {
             let _ = reply.send(result);
             events
         }
+        Command::CheckFill {
+            account,
+            market,
+            side,
+            size,
+            reply,
+        } => {
+            let _ = reply.send(engine.check_fill(account, &market, side, size));
+            Vec::new()
+        }
+        Command::RecordFill {
+            account,
+            market,
+            side,
+            size,
+            px,
+            reply,
+        } => {
+            let (result, events) = match engine.record_fill(account, market, side, size, px, now) {
+                Ok(events) => (
+                    engine
+                        .view(account)
+                        .ok_or(EngineError::UnknownAccount(account)),
+                    events,
+                ),
+                Err(error) => (Err(error), Vec::new()),
+            };
+            let _ = reply.send(result);
+            events
+        }
         Command::Get { account, reply } => {
             let _ = reply.send(engine.view(account));
+            Vec::new()
+        }
+        Command::NetPositions { venue, reply } => {
+            let _ = reply.send(engine.net_positions(venue));
             Vec::new()
         }
     }

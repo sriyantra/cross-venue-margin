@@ -21,6 +21,7 @@ async fn start(read_only: bool) -> (SocketAddr, mpsc::Receiver<Command>) {
         EngineHandle::new(command_tx),
         Metrics::new(),
         read_only,
+        None,
     );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();

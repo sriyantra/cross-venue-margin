@@ -19,7 +19,7 @@ use crate::book::average_price;
 use crate::feed::BookView;
 use crate::risk::{
     Account, AccountState, CASH_ASSET, Health, LiquidationPrice, MarketId, Marks, Position,
-    PositionError, RiskError, Schedule, Side, Thresholds, account_health, asset_value,
+    PositionError, RiskError, Schedule, Side, Thresholds, Venue, account_health, asset_value,
     liquidation_price, matched_sizes, step,
 };
 
@@ -350,35 +350,105 @@ impl Engine {
         size: Decimal,
         now: u64,
     ) -> Result<Vec<Event>, EngineError> {
+        let (account, px, realized_pnl) = self.priced(id, &market, side, size, None)?;
+        self.commit(id, account, market, side, size, px, realized_pnl, now)
+    }
+
+    /// Says whether `fill` would accept this order, without changing
+    /// anything, and returns the price it would fill at. An order that is
+    /// about to be sent to a venue is checked here first.
+    pub fn check_fill(
+        &self,
+        id: AccountId,
+        market: &MarketId,
+        side: Side,
+        size: Decimal,
+    ) -> Result<Decimal, EngineError> {
+        self.priced(id, market, side, size, None)
+            .map(|(_, px, _)| px)
+    }
+
+    /// Records a fill that a venue has already made, at the venue's price.
+    ///
+    /// The margin rules are not applied: the position exists on the venue
+    /// whether or not this account can carry it. If it cannot, the
+    /// reassessment that follows deals with it like any other loss.
+    pub fn record_fill(
+        &mut self,
+        id: AccountId,
+        market: MarketId,
+        side: Side,
+        size: Decimal,
+        px: Decimal,
+        now: u64,
+    ) -> Result<Vec<Event>, EngineError> {
+        let (account, px, realized_pnl) = self.priced(id, &market, side, size, Some(px))?;
+        self.commit(id, account, market, side, size, px, realized_pnl, now)
+    }
+
+    /// The sum of every account's position in each coin on one venue, longs
+    /// positive and shorts negative. It is what a single venue account
+    /// holding all of them would show.
+    pub fn net_positions(&self, venue: Venue) -> BTreeMap<String, Decimal> {
+        let mut net = BTreeMap::new();
+        for entry in self.accounts.values() {
+            for (market, position) in entry.account.positions() {
+                if market.venue == venue {
+                    *net.entry(market.coin.clone()).or_insert(Decimal::ZERO) +=
+                        position.size() * position.side().sign();
+                }
+            }
+        }
+        net.retain(|_, size| !size.is_zero());
+        net
+    }
+
+    /// Works out the account a fill would leave behind, its price and the
+    /// profit it realizes. With `at` the fill is one that already happened
+    /// at that price, and nothing can refuse it but a bad input. Without it
+    /// the fill is priced off the book and must pass the margin rules.
+    fn priced(
+        &self,
+        id: AccountId,
+        market: &MarketId,
+        side: Side,
+        size: Decimal,
+        at: Option<Decimal>,
+    ) -> Result<(Account, Decimal, Decimal), EngineError> {
         let entry = self
             .accounts
-            .get_mut(&id)
+            .get(&id)
             .ok_or(EngineError::UnknownAccount(id))?;
         if matches!(entry.state, AccountState::Closed { .. }) {
             return Err(EngineError::AccountClosed(id));
         }
-        self.schedule.table(&market)?;
-        let mark = *self
-            .marks
-            .get(&market)
-            .ok_or_else(|| EngineError::NoMark(market.clone()))?;
-        Position::new(side, size, mark)?;
-        let px = match self.depths.get(&market) {
-            Some(book) => book_price(book, side, size, false).ok_or_else(|| {
-                EngineError::InsufficientLiquidity {
-                    market: market.clone(),
-                    size,
+        self.schedule.table(market)?;
+        let px = match at {
+            Some(px) => px,
+            None => {
+                let mark = *self
+                    .marks
+                    .get(market)
+                    .ok_or_else(|| EngineError::NoMark(market.clone()))?;
+                Position::new(side, size, mark)?;
+                match self.depths.get(market) {
+                    Some(book) => book_price(book, side, size, false).ok_or_else(|| {
+                        EngineError::InsufficientLiquidity {
+                            market: market.clone(),
+                            size,
+                        }
+                    })?,
+                    None => mark,
                 }
-            })?,
-            None => mark,
+            }
         };
         let fill = Position::new(side, size, px)?;
 
         // Work on a copy, and only keep it if the result is acceptable.
         let mut account = entry.account.clone();
-        let before = account.position(&market).copied();
+        let before = account.position(market).copied();
         let realized_pnl = account.apply_fill(market.clone(), fill)?;
-        let grows = match (before, account.position(&market)) {
+        let grows = match (before, account.position(market)) {
             (_, None) => false,
             (None, Some(_)) => true,
             (Some(before), Some(after)) => {
@@ -387,7 +457,7 @@ impl Engine {
                 after.size() > before.size()
             }
         };
-        if grows {
+        if grows && at.is_none() {
             let health = account_health(&account, &self.marks, &self.schedule)?;
             if health.equity < health.initial_required
                 || health.is_liquidatable()
@@ -396,6 +466,25 @@ impl Engine {
                 return Err(EngineError::InsufficientMargin);
             }
         }
+        Ok((account, px, realized_pnl))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn commit(
+        &mut self,
+        id: AccountId,
+        account: Account,
+        market: MarketId,
+        side: Side,
+        size: Decimal,
+        px: Decimal,
+        realized_pnl: Decimal,
+        now: u64,
+    ) -> Result<Vec<Event>, EngineError> {
+        let entry = self
+            .accounts
+            .get_mut(&id)
+            .ok_or(EngineError::UnknownAccount(id))?;
         entry.account = account;
 
         let mut events = vec![Event::Filled {

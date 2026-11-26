@@ -9,6 +9,7 @@
 pub mod book;
 pub mod config;
 pub mod engine;
+pub mod execution;
 pub mod feed;
 pub mod metrics;
 pub mod risk;

@@ -5,7 +5,7 @@ computes margin for accounts whose positions span those venues on a single
 pool of collateral. The collateral can be dollars, BTC or ETH. Coins are
 kept as coins and valued at their live mark price, with no conversion.
 
-Status: all four roadmap stages are done, and a read-only instance is
+Status: all five roadmap stages are done, and a read-only instance is
 running (see Live instance). Two venues are connected, Hyperliquid and
 OKX, with live books and mark prices from both. A paper account can hold
 positions on both venues against one pool of collateral, each margined by
@@ -15,7 +15,10 @@ account's equity and can liquidate it. Every account
 event goes to an append-only log in Postgres, and the service rebuilds its
 accounts from that log when it starts.
 
-Accounts are paper accounts. The service places no orders and holds no funds.
+By default accounts are paper accounts and the service places no orders.
+Given a Hyperliquid testnet key, fills on Hyperliquid markets become real
+orders on the venue's testnet (see Testnet execution). It never sends an
+order to mainnet and never holds real funds.
 
 ## What works today
 
@@ -43,6 +46,11 @@ Accounts are paper accounts. The service places no orders and holds no funds.
 - Initial margin at each venue's max leverage. A fill that grows a position
   is refused when equity would be below the account's initial margin
   requirement, or when it would leave the account in a margin call.
+- Order execution on Hyperliquid testnet, when a testnet key is set. The
+  engine checks the order, the service signs it and sends it, and the
+  engine records the size and average price the venue reports. A
+  reconciliation route compares the positions the engine has recorded with
+  the positions the wallet holds on the venue.
 - Netting across venues. A long on one venue and a short in the same coin
   on the other are matched, and the matched size pays a hedge rate on each
   leg instead of each venue's full requirement.
@@ -177,6 +185,7 @@ Environment:
 | `MARGIN_CALL_MULTIPLE` | `1.5`               | Margin call starts when equity is below maintenance margin times this |
 | `HEDGE_MARGIN_RATE` | `0.0025`              | Maintenance rate on the matched part of a long and a short in the same coin on different venues. `off` for gross margin |
 | `READ_ONLY` | `false`                        | When `true`, the routes that change an account answer 403 |
+| `HL_TESTNET_KEY` | unset                     | Private key of a Hyperliquid testnet wallet. When set, fills on Hyperliquid markets are orders on testnet, and Hyperliquid books and marks come from testnet. `HL_WS_URL` cannot be set with it |
 | `RUST_LOG`  | `info`                         | Log filter                 |
 
 ## API
@@ -192,6 +201,7 @@ Environment:
 | `GET /accounts/{id}`        | State, health, collateral assets, and positions with liquidation prices |
 | `POST /accounts/{id}/deposits` | Add collateral. Body: `{"asset":"BTC","amount":"0.5"}`. Assets: `USDC`, `BTC`, `ETH` |
 | `POST /accounts/{id}/fills` | Fill against the book. Body: `{"venue":"hyperliquid","coin":"BTC","side":"long","size":"0.5"}` |
+| `GET /venues/hyperliquid/reconciliation` | The accounts' net position per coin against the wallet's position on the venue. 404 without a testnet key |
 | `GET /metrics`              | Metrics in the OpenMetrics text format |
 
 Amounts are JSON strings, so no value passes through a binary float.
@@ -205,6 +215,43 @@ curl -s -H 'content-type: application/json' \
   -d '{"venue":"hyperliquid","coin":"BTC","side":"long","size":"0.5"}' \
   localhost:8080/accounts/1/fills
 ```
+
+## Testnet execution
+
+```sh
+HL_TESTNET_KEY=0x... cargo run --release
+```
+
+With a key, `POST /accounts/{id}/fills` on a Hyperliquid market does this:
+
+1. The engine checks the order against the account, the margin rules and
+   its copy of the testnet book, and returns the price it expects. Nothing
+   changes yet. An order the account cannot carry stops here.
+2. The service signs an order and sends it to the venue: a limit order 5%
+   through the expected price that cancels whatever does not fill at once.
+3. The engine records the fill at the size and average price the venue
+   reports. A partial fill is recorded as the part that filled.
+
+Fills on OKX stay on paper.
+
+- Every account's orders go through one wallet, so the wallet's position in
+  a coin is the sum of the accounts' positions in it.
+  `GET /venues/hyperliquid/reconciliation` shows both and the difference.
+- When the engine liquidates a position on Hyperliquid, it closes it in its
+  own books at once and a separate task sends the closing order to the
+  venue. The price the venue gives can differ from the one the engine
+  recorded.
+- Hyperliquid books and marks come from testnet, whose prices are not
+  mainnet's. OKX prices stay live, so the two venues can disagree by more
+  than they do in production.
+- The signing is checked against the venue's reference client: the same
+  key, order and nonce must give the same signature. The signature is
+  bound to testnet: on mainnet it does not verify as this wallet's.
+- If a request to the venue times out, the order can have filled without
+  the engine recording it. Reconciliation shows the difference. Nothing
+  repairs it automatically.
+- The wallet's own collateral on the venue is not tied to the accounts'
+  collateral in the engine, and venue fees are not charged to accounts.
 
 ## Design
 
@@ -236,6 +283,10 @@ Postgres     --events in order, at startup--> engine (rebuilt before it runs)
   Coins come back as amounts, and their value comes from the live marks.
   It does not re-run the decisions, because mark prices are not recorded.
   The database rejects any update, delete or truncate on the table.
+- The engine task never waits on a venue. An order for testnet is sent by
+  the API handler between two engine commands, one that checks it and one
+  that records what filled. Handlers take turns, so two orders never
+  interleave those steps.
 - An API reply can reach the client before its event is committed to
   Postgres. A crash in that window loses the event.
 - Prices and sizes are `rust_decimal::Decimal`, parsed from the venue's
@@ -299,6 +350,10 @@ cargo test
   `TEST_DATABASE_URL=postgres://postgres@127.0.0.1:5432/postgres cargo test`
 - `tests/server.rs` runs the API on a local port and checks that a
   read-only instance refuses writes before they reach the engine.
+- `tests/execution.rs` runs the API with order execution on, against a
+  local stand-in for the venue: the order that is sent, a partial fill
+  recorded at the venue's price, refusals by the engine and by the venue,
+  reconciliation, and the closing order for a liquidation.
 - `tests/engine.rs` runs the engine task against hand-driven mark channels:
   liquidation on a mark move, a withdrawn mark, a dead connector, and a
   fill priced off a book.
@@ -311,3 +366,4 @@ cargo test
 3. Second venue, an append-only event log in Postgres, and rebuilding
    state from that log. Done.
 4. Docker image, metrics for feed-to-decision latency, deployment. Done.
+5. Order execution on Hyperliquid testnet, with reconciliation. Done.
