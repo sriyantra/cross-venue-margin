@@ -119,6 +119,7 @@ mod tests {
             unrealized_pnl: dec!(0),
             notional: dec!(0),
             maintenance_required,
+            initial_required: dec!(0),
             margin_available: equity - maintenance_required,
         }
     }

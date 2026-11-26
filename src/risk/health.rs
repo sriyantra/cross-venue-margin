@@ -3,6 +3,7 @@
 use rust_decimal::Decimal;
 use serde::Serialize;
 
+use super::netting::{matched_sizes, requirement};
 use super::num::{add, mul, sub};
 use super::{Account, MarketId, Marks, RiskError, Schedule};
 
@@ -18,8 +19,12 @@ pub struct Health {
     pub unrealized_pnl: Decimal,
     /// Sum of position values. Long and short both count as positive.
     pub notional: Decimal,
-    /// Sum of every position's maintenance margin.
+    /// Sum of every position's maintenance margin, after netting.
     pub maintenance_required: Decimal,
+    /// Sum of every position's initial margin at its venue's max leverage,
+    /// after netting. A fill that grows a position needs equity of at least
+    /// this much.
+    pub initial_required: Decimal,
     /// Equity minus maintenance margin. Negative means liquidatable.
     pub margin_available: Decimal,
 }
@@ -71,17 +76,18 @@ pub fn account_health(
     let mut unrealized_pnl = Decimal::ZERO;
     let mut notional = Decimal::ZERO;
     let mut maintenance_required = Decimal::ZERO;
+    let mut initial_required = Decimal::ZERO;
 
+    let matched = matched_sizes(account, schedule)?;
     for (market, position) in account.positions() {
         let mark = mark_for(marks, market)?;
-        let position_notional = position.notional(mark)?;
-        let maintenance = schedule
-            .table(market)?
-            .maintenance(position.size(), position_notional)?;
+        let hedged = matched.get(market).copied().unwrap_or(Decimal::ZERO);
+        let required = requirement(schedule, market, position, hedged, mark)?;
 
         unrealized_pnl = add(unrealized_pnl, position.unrealized_pnl(mark)?)?;
-        notional = add(notional, position_notional)?;
-        maintenance_required = add(maintenance_required, maintenance)?;
+        notional = add(notional, position.notional(mark)?)?;
+        maintenance_required = add(maintenance_required, required.maintenance)?;
+        initial_required = add(initial_required, required.initial)?;
     }
 
     let mut collateral_value = Decimal::ZERO;
@@ -99,6 +105,7 @@ pub fn account_health(
         unrealized_pnl,
         notional,
         maintenance_required,
+        initial_required,
         margin_available: sub(equity, maintenance_required)?,
     })
 }

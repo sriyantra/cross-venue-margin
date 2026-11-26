@@ -4,6 +4,7 @@ use rust_decimal::Decimal;
 use serde::Serialize;
 
 use super::health::{asset_value, mark_for};
+use super::netting::{matched_sizes, requirement};
 use super::num::{add, div, mul, sub};
 use super::{Account, MarginTable, MarketId, Marks, RiskError, Schedule, Side, Tier};
 
@@ -36,7 +37,9 @@ pub enum LiquidationPrice {
 /// Solves `equity(px) = maintenance(px)` for the mark of `market`.
 ///
 /// In one tier the margin available is a straight line in the price:
-/// `base + deduction + px * (size * (sign - rate) + held)`, where `held` is
+/// `base + deduction + px * (size * sign - outright * rate - hedged *
+/// hedge_rate + held)`. `hedged` is the part of the position matched by an
+/// opposite position on another venue, `outright` is the rest, and `held` is
 /// the haircut amount of collateral priced by this same market. In a table
 /// keyed by notional the rate and deduction change from tier to tier, so
 /// the answer is found by walking the tiers in the direction the price has
@@ -59,15 +62,35 @@ pub fn liquidation_price(
         .position(market)
         .ok_or_else(|| RiskError::NoPosition(market.clone()))?;
     let size = position.size();
+    let matched = matched_sizes(account, schedule)?;
+    let hedged = matched.get(market).copied().unwrap_or(Decimal::ZERO);
+    // The part of the position that pays its venue's table. The hedged part
+    // pays the hedge rate at every price.
+    let outright = sub(size, hedged)?;
+    let hedge_rate = schedule.hedge_rate().unwrap_or(Decimal::ZERO);
+    let one_line = |rate| {
+        [Tier {
+            lower_bound: Decimal::ZERO,
+            rate,
+            deduction: Decimal::ZERO,
+        }]
+    };
     let fixed;
     let tiers = match schedule.table(market)? {
-        MarginTable::ByNotional(table) => table.tiers(),
+        MarginTable::ByNotional(table) if outright > Decimal::ZERO => table.tiers(),
+        MarginTable::ByNotional(_) => {
+            fixed = one_line(Decimal::ZERO);
+            &fixed[..]
+        }
         MarginTable::BySize(table) => {
-            fixed = [Tier {
-                lower_bound: Decimal::ZERO,
-                rate: table.rate_for(size)?,
-                deduction: Decimal::ZERO,
-            }];
+            // Asked for the whole size first, so a position past the table
+            // is an error whether or not it is hedged.
+            table.rate_for(size)?;
+            fixed = one_line(if outright > Decimal::ZERO {
+                table.rate_for(outright)?
+            } else {
+                Decimal::ZERO
+            });
             &fixed[..]
         }
     };
@@ -90,15 +113,17 @@ pub fn liquidation_price(
             continue;
         }
         let mark = mark_for(marks, other)?;
-        let maintenance = schedule
-            .table(other)?
-            .maintenance(held.size(), held.notional(mark)?)?;
+        let other_hedged = matched.get(other).copied().unwrap_or(Decimal::ZERO);
+        let maintenance = requirement(schedule, other, held, other_hedged, mark)?.maintenance;
         base = sub(add(base, held.unrealized_pnl(mark)?)?, maintenance)?;
     }
     let sign = position.side().sign();
     base = sub(base, mul(mul(sign, size)?, position.entry_px())?)?;
 
-    let slope = |tier: &Tier| add(mul(size, sub(sign, tier.rate)?)?, held);
+    let slope = |tier: &Tier| {
+        let required = add(mul(outright, tier.rate)?, mul(hedged, hedge_rate)?)?;
+        add(sub(mul(size, sign)?, required)?, held)
+    };
     let margin_at = |tier: &Tier, px: Decimal| -> Result<Decimal, RiskError> {
         add(add(base, tier.deduction)?, mul(px, slope(tier)?)?)
     };
@@ -106,10 +131,10 @@ pub fn liquidation_price(
         let px = div(-add(base, tier.deduction)?, slope(tier)?)?;
         Ok(LiquidationPrice::At(px))
     };
-    // The price at which this position's notional reaches a tier's bound.
+    // The price at which the outright part's notional reaches a tier's bound.
     // `None` means the position is too small to reach that bound at any
     // price the decimal type can hold.
-    let bound_px = |tier: &Tier| tier.lower_bound.checked_div(size);
+    let bound_px = |tier: &Tier| tier.lower_bound.checked_div(outright);
 
     match position.side() {
         // Margin rises with the price inside every tier. Walk down from the

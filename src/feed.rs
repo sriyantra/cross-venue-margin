@@ -141,6 +141,11 @@ impl Feeds {
         self.marks.iter().map(|(market, rx)| (market, rx.clone()))
     }
 
+    /// Every market's book receiver, for a task that reads all of them.
+    pub fn book_receivers(&self) -> impl Iterator<Item = (&MarketId, BookRx)> {
+        self.books.iter().map(|(market, rx)| (market, rx.clone()))
+    }
+
     /// Every tracked market, ordered by venue then coin.
     pub fn markets(&self) -> impl Iterator<Item = &MarketId> {
         self.books.keys()

@@ -51,6 +51,8 @@ pub enum ScheduleError {
     NonPositiveBound(Decimal),
     #[error("tier values overflow")]
     Overflow,
+    #[error("initial margin rate {0} must be at least the maintenance rate and at most 1")]
+    InitialRateOutOfRange(Decimal),
     #[error("haircut {0} must be at least 0 and below 1")]
     HaircutOutOfRange(Decimal),
 }
@@ -156,6 +158,14 @@ impl TierTable {
         let tier = self.tier_for(notional);
         sub(mul(notional, tier.rate)?, tier.deduction)
     }
+
+    /// Initial margin for a position of this notional at the bracket's max
+    /// leverage. The maintenance rate is half the initial rate, so this is
+    /// the notional at twice the bracket's maintenance rate.
+    pub fn initial(&self, notional: Decimal) -> Result<Decimal, RiskError> {
+        let tier = self.tier_for(notional);
+        mul(notional, mul(tier.rate, Decimal::TWO)?)
+    }
 }
 
 /// One size bracket: positions up to and including `max_size` pay `rate`
@@ -164,6 +174,8 @@ impl TierTable {
 pub struct SizeTier {
     pub max_size: Decimal,
     pub rate: Decimal,
+    /// Initial margin rate: one over the bracket's max leverage.
+    pub initial_rate: Decimal,
 }
 
 /// A validated table keyed by position size, in units of the coin.
@@ -175,15 +187,31 @@ pub struct SizeTable {
 impl SizeTable {
     /// Builds a table from `(max_size, rate)` brackets in increasing order.
     /// The last bracket's `max_size` is the largest position the table
-    /// covers.
+    /// covers. The initial margin rate of each bracket is set to twice its
+    /// maintenance rate.
     pub fn new(brackets: &[(Decimal, Decimal)]) -> Result<Self, ScheduleError> {
+        let with_initial: Vec<(Decimal, Decimal, Decimal)> = brackets
+            .iter()
+            .map(|&(max_size, rate)| (max_size, rate, rate + rate))
+            .collect();
+        Self::with_initial_rates(&with_initial)
+    }
+
+    /// Builds a table from `(max_size, rate, initial_rate)` brackets, for a
+    /// venue that publishes both rates.
+    pub fn with_initial_rates(
+        brackets: &[(Decimal, Decimal, Decimal)],
+    ) -> Result<Self, ScheduleError> {
         let mut tiers: Vec<SizeTier> = Vec::with_capacity(brackets.len());
-        for &(max_size, rate) in brackets {
+        for &(max_size, rate, initial_rate) in brackets {
             if max_size <= Decimal::ZERO {
                 return Err(ScheduleError::NonPositiveBound(max_size));
             }
             if rate <= Decimal::ZERO || rate >= Decimal::ONE {
                 return Err(ScheduleError::RateOutOfRange(rate));
+            }
+            if initial_rate < rate || initial_rate > Decimal::ONE {
+                return Err(ScheduleError::InitialRateOutOfRange(initial_rate));
             }
             if let Some(prev) = tiers.last() {
                 if max_size <= prev.max_size {
@@ -193,7 +221,11 @@ impl SizeTable {
                     return Err(ScheduleError::RateDecreasing);
                 }
             }
-            tiers.push(SizeTier { max_size, rate });
+            tiers.push(SizeTier {
+                max_size,
+                rate,
+                initial_rate,
+            });
         }
         if tiers.is_empty() {
             return Err(ScheduleError::Empty);
@@ -209,13 +241,22 @@ impl SizeTable {
     /// belongs to the lower bracket. A size past the last bracket has no
     /// rate.
     pub fn rate_for(&self, size: Decimal) -> Result<Decimal, RiskError> {
-        match self.tiers.iter().find(|tier| size <= tier.max_size) {
-            Some(tier) => Ok(tier.rate),
-            None => Err(RiskError::AboveSchedule {
+        self.tier_for(size).map(|tier| tier.rate)
+    }
+
+    /// The initial margin rate for a position of this size.
+    pub fn initial_rate_for(&self, size: Decimal) -> Result<Decimal, RiskError> {
+        self.tier_for(size).map(|tier| tier.initial_rate)
+    }
+
+    fn tier_for(&self, size: Decimal) -> Result<&SizeTier, RiskError> {
+        self.tiers
+            .iter()
+            .find(|tier| size <= tier.max_size)
+            .ok_or_else(|| RiskError::AboveSchedule {
                 size,
                 max: self.tiers[self.tiers.len() - 1].max_size,
-            }),
-        }
+            })
     }
 }
 
@@ -232,6 +273,15 @@ impl MarginTable {
         match self {
             MarginTable::ByNotional(table) => table.maintenance(notional),
             MarginTable::BySize(table) => mul(notional, table.rate_for(size)?),
+        }
+    }
+
+    /// Initial margin for a position of this size and notional at the
+    /// venue's max leverage for it.
+    pub fn initial(&self, size: Decimal, notional: Decimal) -> Result<Decimal, RiskError> {
+        match self {
+            MarginTable::ByNotional(table) => table.initial(notional),
+            MarginTable::BySize(table) => mul(notional, table.initial_rate_for(size)?),
         }
     }
 }
@@ -288,6 +338,7 @@ impl CollateralRule {
 pub struct Schedule {
     tables: BTreeMap<MarketId, MarginTable>,
     collateral: BTreeMap<String, CollateralRule>,
+    hedge_rate: Option<Decimal>,
 }
 
 impl Schedule {
@@ -307,6 +358,22 @@ impl Schedule {
         self.tables
             .get(market)
             .ok_or_else(|| RiskError::MissingSchedule(market.clone()))
+    }
+
+    /// Sets the maintenance rate for the matched part of a long and a short
+    /// in the same coin on different venues. `None` turns netting off.
+    pub fn set_hedge_rate(&mut self, rate: Option<Decimal>) -> Result<(), ScheduleError> {
+        if let Some(rate) = rate
+            && (rate <= Decimal::ZERO || rate >= Decimal::ONE)
+        {
+            return Err(ScheduleError::RateOutOfRange(rate));
+        }
+        self.hedge_rate = rate;
+        Ok(())
+    }
+
+    pub fn hedge_rate(&self) -> Option<Decimal> {
+        self.hedge_rate
     }
 
     pub fn insert_collateral(

@@ -16,6 +16,34 @@ pub struct Level {
     pub sz: Decimal,
 }
 
+/// The average price of taking `size` from `levels`, best level first.
+///
+/// With `partial` unset the answer is `None` when the levels hold less than
+/// `size`. With it set, whatever the levels cannot fill is priced at the
+/// last level, which is the worst price the book shows.
+pub fn average_price(levels: &[Level], size: Decimal, partial: bool) -> Option<Decimal> {
+    if size <= Decimal::ZERO {
+        return None;
+    }
+    let mut left = size;
+    let mut cost = Decimal::ZERO;
+    for level in levels {
+        let take = level.sz.min(left);
+        cost = cost.checked_add(take.checked_mul(level.px)?)?;
+        left -= take;
+        if left.is_zero() {
+            break;
+        }
+    }
+    if left > Decimal::ZERO {
+        if !partial {
+            return None;
+        }
+        cost = cost.checked_add(left.checked_mul(levels.last()?.px)?)?;
+    }
+    cost.checked_div(size)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Side {
     Bid,
@@ -448,5 +476,30 @@ mod tests {
         .unwrap();
         assert!(book.is_live());
         assert_eq!(book.time(), Some(200));
+    }
+
+    #[test]
+    fn average_price_walks_the_levels() {
+        let level = |px, sz| Level { px, sz };
+        let asks = [
+            level(dec!(100), dec!(1)),
+            level(dec!(101), dec!(2)),
+            level(dec!(103), dec!(5)),
+        ];
+        // Inside the first level.
+        assert_eq!(average_price(&asks, dec!(0.5), false), Some(dec!(100)));
+        // 1 at 100 and 1 at 101.
+        assert_eq!(average_price(&asks, dec!(2), false), Some(dec!(100.5)));
+        // Exactly the whole side: 100 + 202 + 515 over 8.
+        assert_eq!(average_price(&asks, dec!(8), false), Some(dec!(102.125)));
+        // More than the side holds.
+        assert_eq!(average_price(&asks, dec!(9), false), None);
+        // The same, with the last unit priced at the last level.
+        assert_eq!(
+            average_price(&asks, dec!(9), true),
+            Some((dec!(817) + dec!(103)) / dec!(9))
+        );
+        assert_eq!(average_price(&[], dec!(1), true), None);
+        assert_eq!(average_price(&asks, dec!(0), false), None);
     }
 }

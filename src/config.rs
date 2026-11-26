@@ -34,6 +34,9 @@ pub struct Config {
     /// A margin call starts when equity falls below maintenance margin
     /// times this number.
     pub margin_call_multiple: Decimal,
+    /// Maintenance rate for the matched part of a long and a short in the
+    /// same coin on different venues. `None` turns netting off.
+    pub hedge_margin_rate: Option<Decimal>,
     /// Postgres URL for the event log. Without it events are only logged,
     /// and accounts do not survive a restart.
     pub database_url: Option<Secret>,
@@ -70,6 +73,16 @@ impl Config {
             .parse()
             .context("MARGIN_CALL_MULTIPLE must be a decimal such as 1.5")?;
 
+        let hedge_margin_rate = match std::env::var("HEDGE_MARGIN_RATE") {
+            Err(_) => Some(Decimal::new(25, 4)),
+            Ok(value) if value == "off" => None,
+            Ok(value) => Some(
+                value
+                    .parse()
+                    .context("HEDGE_MARGIN_RATE must be a decimal such as 0.0025, or off")?,
+            ),
+        };
+
         let database_url = std::env::var("DATABASE_URL")
             .ok()
             .filter(|url| !url.is_empty())
@@ -90,6 +103,7 @@ impl Config {
             coins,
             bind,
             margin_call_multiple,
+            hedge_margin_rate,
             database_url,
             read_only,
         })

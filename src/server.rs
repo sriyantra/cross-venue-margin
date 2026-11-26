@@ -263,7 +263,9 @@ async fn render_metrics(State(metrics): State<Metrics>) -> Response {
 fn engine_error(error: EngineError) -> Response {
     let status = match &error {
         EngineError::UnknownAccount(_) => StatusCode::NOT_FOUND,
-        EngineError::AccountClosed(_) | EngineError::InsufficientMargin => StatusCode::CONFLICT,
+        EngineError::AccountClosed(_)
+        | EngineError::InsufficientMargin
+        | EngineError::InsufficientLiquidity { .. } => StatusCode::CONFLICT,
         EngineError::NoMark(_) | EngineError::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
         EngineError::NegativeCollateral(_)
         | EngineError::NonPositiveDeposit(_)

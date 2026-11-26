@@ -67,8 +67,10 @@ pub fn instrument(coin: &str) -> Option<Instrument> {
     })
 }
 
-/// Maintenance margin brackets for a coin's USDT perpetual in cross margin,
-/// from the venue's public position tiers endpoint as read on 2026-11-22.
+/// Margin brackets for a coin's USDT perpetual in cross margin, from the
+/// venue's public position tiers endpoint. Maintenance rates as read on
+/// 2026-11-22, initial rates as read on 2026-11-25. The initial rate starts
+/// at 1% (100x) and rises by half a percent per bracket.
 /// The venue lists them in contracts, and they are stored here in units of
 /// the coin. Only the first 12 of 99 tiers are kept, which covers positions
 /// up to 2,000 BTC and 25,000 ETH. Larger positions are refused.
@@ -99,12 +101,20 @@ pub fn maintenance_table(coin: &str) -> Option<SizeTable> {
         _ => return None,
     };
     let contract_value = instrument(coin)?.contract_value;
-    let brackets: Vec<(Decimal, Decimal)> = max_contracts
+    let brackets: Vec<(Decimal, Decimal, Decimal)> = max_contracts
         .iter()
         .zip(RATES)
-        .map(|(contracts, rate)| (Decimal::from(*contracts) * contract_value, rate))
+        .enumerate()
+        .map(|(i, (contracts, rate))| {
+            let initial_rate = dec!(0.01) + dec!(0.005) * Decimal::from(i as u32);
+            (
+                Decimal::from(*contracts) * contract_value,
+                rate,
+                initial_rate,
+            )
+        })
         .collect();
-    SizeTable::new(&brackets).ok()
+    SizeTable::with_initial_rates(&brackets).ok()
 }
 
 // ---------------------------------------------------------------------------

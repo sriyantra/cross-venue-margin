@@ -128,6 +128,61 @@ fn account_with_coins() -> impl Strategy<Value = (Account, Marks)> {
     })
 }
 
+fn okx_btc() -> MarketId {
+    MarketId::new(Venue::Okx, "BTC")
+}
+
+/// The schedule above with BTC also listed on the second venue, and a long
+/// and a short in the same coin on different venues netted at 0.25%.
+fn hedged_schedule() -> Schedule {
+    let mut schedule = schedule();
+    schedule.insert(
+        okx_btc(),
+        SizeTable::new(&[
+            (dec!(1), dec!(0.004)),
+            (dec!(10), dec!(0.01)),
+            (dec!(100_000), dec!(0.03)),
+        ])
+        .unwrap(),
+    );
+    schedule.set_hedge_rate(Some(dec!(0.0025))).unwrap();
+    schedule
+}
+
+/// An account with BTC on both venues, usually on opposite sides, sometimes
+/// with ETH beside it and coins as collateral.
+fn hedged_account() -> impl Strategy<Value = (Account, Marks)> {
+    let legs = (side(), size(), price(), any::<bool>(), size(), price());
+    let eth = proptest::option::of(position());
+    let coin = proptest::option::of(size());
+    let cash = -5_000i64..=3_000;
+    let marks = proptest::collection::vec(price(), 3);
+    (legs, eth, coin, cash, marks).prop_map(|(legs, eth, coin, cash_bps, marks)| {
+        let (side, a_size, a_entry, same_side, b_size, b_entry) = legs;
+        let other = match (side, same_side) {
+            (Side::Long, false) | (Side::Short, true) => Side::Short,
+            _ => Side::Long,
+        };
+        let first = Position::new(side, a_size, a_entry).unwrap();
+        let second = Position::new(other, b_size, b_entry).unwrap();
+        let cost = a_size * a_entry + b_size * b_entry;
+        let mut account = Account::new((cost * Decimal::new(cash_bps, 4)).round_dp(2));
+        account.set_position(market("BTC"), first);
+        account.set_position(okx_btc(), second);
+        if let Some(eth) = eth {
+            account.set_position(market("ETH"), eth);
+        }
+        if let Some(amount) = coin {
+            account.deposit("BTC", amount).unwrap();
+        }
+        let marks = [market("BTC"), okx_btc(), market("ETH")]
+            .into_iter()
+            .zip(marks)
+            .collect();
+        (account, marks)
+    })
+}
+
 fn margin_with(account: &Account, marks: &Marks, target: &MarketId, px: Decimal) -> Decimal {
     let mut moved = marks.clone();
     moved.insert(target.clone(), px);
@@ -267,6 +322,80 @@ proptest! {
         }
     }
 
+    /// Netting only ever lowers the requirement, changes nothing but the
+    /// requirement, and changes nothing at all when no long faces a short in
+    /// the same coin.
+    #[test]
+    fn netting_lowers_margin_and_only_for_hedged_pairs((account, marks) in hedged_account()) {
+        let net_schedule = hedged_schedule();
+        let mut gross_schedule = net_schedule.clone();
+        gross_schedule.set_hedge_rate(None).unwrap();
+        let net = account_health(&account, &marks, &net_schedule).unwrap();
+        let gross = account_health(&account, &marks, &gross_schedule).unwrap();
+
+        prop_assert_eq!(net.equity, gross.equity);
+        prop_assert_eq!(net.notional, gross.notional);
+        prop_assert!(net.maintenance_required <= gross.maintenance_required);
+        prop_assert!(net.initial_required <= gross.initial_required);
+        prop_assert!(net.initial_required >= net.maintenance_required);
+
+        let sides: Vec<Side> = [market("BTC"), okx_btc()]
+            .iter()
+            .map(|m| account.position(m).unwrap().side())
+            .collect();
+        if sides[0] == sides[1] {
+            prop_assert_eq!(net, gross);
+        } else {
+            prop_assert!(net.maintenance_required < gross.maintenance_required);
+        }
+    }
+
+    /// With hedged legs on two venues the liquidation price of each leg is
+    /// still where margin available is zero.
+    #[test]
+    fn liquidation_price_holds_with_hedged_legs((account, marks) in hedged_account()) {
+        let schedule = hedged_schedule();
+        let tiny = dec!(0.00000001);
+        let huge = dec!(10_000_000_000);
+
+        for (target, position) in account.positions() {
+            let margin = |px: Decimal| {
+                let mut moved = marks.clone();
+                moved.insert(target.clone(), px);
+                account_health(&account, &moved, &schedule).unwrap().margin_available
+            };
+            match liquidation_price(&account, target, &marks, &schedule).unwrap() {
+                LiquidationPrice::At(px) => {
+                    prop_assert!(px > dec!(0));
+                    prop_assert!(margin(px).abs() < TOLERANCE, "margin at {px} is {}", margin(px));
+                    if px >= dec!(0.01) {
+                        match position.side() {
+                            Side::Long => prop_assert!(
+                                margin(px * dec!(1.01)) > dec!(0) && margin(px * dec!(0.99)) < dec!(0)
+                            ),
+                            Side::Short => prop_assert!(margin(px * dec!(1.01)) < dec!(0)),
+                        }
+                    }
+                }
+                LiquidationPrice::Below(px) => {
+                    prop_assert_eq!(position.side(), Side::Short);
+                    prop_assert!(margin(px).abs() < TOLERANCE, "margin at {px} is {}", margin(px));
+                    prop_assert!(margin(huge) >= dec!(0));
+                }
+                LiquidationPrice::Never => {
+                    prop_assert!(margin(tiny) >= dec!(0));
+                    if position.side() == Side::Short {
+                        prop_assert!(margin(huge) >= dec!(0));
+                    }
+                }
+                LiquidationPrice::AtAnyPrice => {
+                    prop_assert_eq!(position.side(), Side::Short);
+                    prop_assert!(margin(tiny) < dec!(0) && margin(huge) < dec!(0));
+                }
+            }
+        }
+    }
+
     /// A bigger position never needs less maintenance margin, and the
     /// requirement does not jump when a position crosses into the next tier.
     #[test]
@@ -307,6 +436,7 @@ proptest! {
                 unrealized_pnl: dec!(0),
                 notional: dec!(0),
                 maintenance_required: maintenance,
+                initial_required: dec!(0),
                 margin_available: equity - maintenance,
             };
             let (next, transition) = step(state, &health, has_positions, &thresholds, now as u64).unwrap();

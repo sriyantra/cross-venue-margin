@@ -36,8 +36,16 @@ Accounts are paper accounts. The service places no orders and holds no funds.
   resubscribed. Sizes are converted from contracts to coin.
 - OKX mark price per market (`mark-price`), with the same staleness rule.
 - HTTP and WebSocket API over the current books and marks.
-- Paper accounts with one pool of collateral. Orders fill at the venue's
-  mark. A fill that would leave the account in a margin call is refused.
+- Paper accounts with one pool of collateral. An order walks the venue's
+  live book: a buy takes asks and a sell takes bids, level by level, and
+  fills at the average. An order larger than that side of the book is
+  refused.
+- Initial margin at each venue's max leverage. A fill that grows a position
+  is refused when equity would be below the account's initial margin
+  requirement, or when it would leave the account in a margin call.
+- Netting across venues. A long on one venue and a short in the same coin
+  on the other are matched, and the matched size pays a hedge rate on each
+  leg instead of each venue's full requirement.
 - Multi-asset collateral. An account can deposit USDC, BTC and ETH. A coin
   stays a coin: it counts toward equity at its Hyperliquid mark less a
   haircut, and it backs positions on both venues.
@@ -46,8 +54,9 @@ Accounts are paper accounts. The service places no orders and holds no funds.
   coin: a long backed by its own coin liquidates sooner, and a short
   covered by at least as much of the coin has no liquidation price.
 - An account state machine: open, margin call, liquidating, closed. An
-  account whose equity falls below maintenance margin is closed out at the
-  mark.
+  account whose equity falls below maintenance margin is closed out
+  against the book: longs are sold into the bids and shorts bought from
+  the asks.
 - Every account event (opened, deposit, filled, state changed, liquidated) is
   written to an append-only Postgres table through a bounded channel. A
   slow or failing database slows the engine down. It does not drop events.
@@ -58,8 +67,25 @@ Accounts are paper accounts. The service places no orders and holds no funds.
 
 ## Margin model
 
-- Gross cross margin. Every position pays its own maintenance margin, and
-  positions offset each other only through profit and loss in account equity.
+- Cross margin with netting of hedged pairs. A position pays its own
+  venue's maintenance margin, except for the part of it that is matched by
+  an opposite position in the same coin on the other venue.
+- The matched part of each leg pays `matched size * mark * hedge rate`
+  for maintenance and twice that for initial margin. The hedge rate is
+  0.25% by default (`HEDGE_MARGIN_RATE`). It is this project's own number.
+  It stands for the risk that is left on a matched pair, which is the gap
+  between the two venues' marks. The unmatched part of the larger leg
+  pays its venue's table for its own size.
+- Netting assumes collateral can cover a loss on either venue at once.
+  Between real venues it cannot, and nothing here charges for the time it
+  takes to move it. `HEDGE_MARGIN_RATE=off` gives gross margin, where every
+  position pays in full.
+- Only the same coin on different venues is netted. There is no offset
+  between different coins, and no scenario or stress-based margin.
+- Initial margin is `notional / max leverage` for the bracket a position
+  is in: twice the maintenance rate on Hyperliquid by its rule, and OKX's
+  published initial rate per tier (1% for the first, read on 2026-11-25).
+  There is no leverage setting per account or per position.
 - Maintenance margin per position is `notional * rate - deduction`, from a
   tier table per market. The Hyperliquid tables for BTC and ETH are built
   from the max-leverage brackets in its documentation (read on 2026-11-22),
@@ -94,8 +120,14 @@ Accounts are paper accounts. The service places no orders and holds no funds.
   still count toward its equity. No interest is charged on that balance.
 - Coins are never sold. Liquidation closes positions and leaves the coins
   in the account. There are no withdrawals.
-- Liquidation closes every position at the mark in one step. Real venues
-  liquidate in stages and at worse prices.
+- Liquidation closes every position in one step against the book the
+  service has at that moment. Size the book cannot take is priced at its
+  last level. Hyperliquid's feed carries 20 levels a side, so a large
+  position is priced as if the 20th level were bottomless. Real venues
+  liquidate in stages. With no live book for a market, fills and
+  liquidations there use the mark.
+- Paper fills do not move the book. Two fills in a row see the same
+  liquidity.
 - A mark that gaps past the liquidation price leaves the closed account
   with negative collateral. There is no insurance fund or bad-debt handling.
 - While any of an account's markets has no current mark, or the mark that
@@ -143,6 +175,7 @@ Environment:
 | `BIND`      | `127.0.0.1:8080`               | API listen address         |
 | `DATABASE_URL` | unset                       | Postgres URL for the event log. Without it events are only logged and accounts are lost on restart |
 | `MARGIN_CALL_MULTIPLE` | `1.5`               | Margin call starts when equity is below maintenance margin times this |
+| `HEDGE_MARGIN_RATE` | `0.0025`              | Maintenance rate on the matched part of a long and a short in the same coin on different venues. `off` for gross margin |
 | `READ_ONLY` | `false`                        | When `true`, the routes that change an account answer 403 |
 | `RUST_LOG`  | `info`                         | Log filter                 |
 
@@ -158,7 +191,7 @@ Environment:
 | `POST /accounts`            | Open a paper account. Body: `{"collateral":"5000"}` |
 | `GET /accounts/{id}`        | State, health, collateral assets, and positions with liquidation prices |
 | `POST /accounts/{id}/deposits` | Add collateral. Body: `{"asset":"BTC","amount":"0.5"}`. Assets: `USDC`, `BTC`, `ETH` |
-| `POST /accounts/{id}/fills` | Fill at the mark. Body: `{"venue":"hyperliquid","coin":"BTC","side":"long","size":"0.5"}` |
+| `POST /accounts/{id}/fills` | Fill against the book. Body: `{"venue":"hyperliquid","coin":"BTC","side":"long","size":"0.5"}` |
 | `GET /metrics`              | Metrics in the OpenMetrics text format |
 
 Amounts are JSON strings, so no value passes through a binary float.
@@ -177,7 +210,7 @@ curl -s -H 'content-type: application/json' \
 
 ```
 venue task (owns socket + books) --watch: book, mark--> API handlers
-                                 --watch: mark-------> engine task (owns accounts)
+                                 --watch: mark, book--> engine task (owns accounts)
 API handlers --bounded mpsc: commands, one-shot replies--> engine task
 engine task  --bounded mpsc: events--> log writer task --> Postgres (append-only)
 Postgres     --events in order, at startup--> engine (rebuilt before it runs)
@@ -247,7 +280,9 @@ cargo test
   price, fills at the mark conserve equity, and the state machine always
   matches the latest health reading. The liquidation price rule is also
   checked for accounts holding BTC and ETH as collateral, with dollar
-  balances above and below zero.
+  balances above and below zero, and for accounts with hedged legs on both
+  venues. Netting must never raise a requirement and must change nothing
+  when no long faces a short in the same coin.
 - `tests/venue_parity.rs` compares the risk core with Hyperliquid's own
   numbers for 11 real accounts recorded from its public API on 2026-11-22
   (addresses removed). Maintenance margin and every liquidation price must
@@ -265,7 +300,8 @@ cargo test
 - `tests/server.rs` runs the API on a local port and checks that a
   read-only instance refuses writes before they reach the engine.
 - `tests/engine.rs` runs the engine task against hand-driven mark channels:
-  liquidation on a mark move, a withdrawn mark, and a dead connector.
+  liquidation on a mark move, a withdrawn mark, a dead connector, and a
+  fill priced off a book.
 
 ## Roadmap
 

@@ -31,6 +31,7 @@ fn parts() -> (Schedule, Thresholds) {
     );
     let [hl, _] = markets();
     schedule.insert_collateral("BTC", CollateralRule::new(hl, dec!(0.10)).unwrap());
+    schedule.set_hedge_rate(Some(dec!(0.0025))).unwrap();
     (schedule, Thresholds::new(dec!(1.5)).unwrap())
 }
 

@@ -56,6 +56,7 @@ fn start_with_event_queue(capacity: usize) -> Harness {
     let task = tokio::spawn(task::run(
         engine,
         marks,
+        Vec::new(),
         command_rx,
         event_tx,
         metrics.clone(),
@@ -313,4 +314,73 @@ async fn shutdown_gets_through_a_full_event_queue() {
         .await
         .expect("engine did not stop")
         .unwrap();
+}
+
+#[tokio::test]
+async fn fill_is_priced_off_the_book_the_task_was_given() {
+    use cross_venue_margin::book::Level;
+    use cross_venue_margin::feed::BookView;
+    use std::sync::Arc;
+
+    let (feeds, mut publishers) = Feeds::channels(&[btc()]);
+    let mut schedule = Schedule::new();
+    schedule.insert(btc(), TierTable::flat(dec!(0.0125)).unwrap());
+    let engine = Engine::new(schedule, Thresholds::new(dec!(1.5)).unwrap());
+    let (command_tx, command_rx) = mpsc::channel::<Command>(8);
+    let (event_tx, mut events) = mpsc::channel(64);
+    let shutdown = CancellationToken::new();
+    let task = tokio::spawn(task::run(
+        engine,
+        vec![(btc(), feeds.subscribe_mark(&btc()).unwrap())],
+        vec![(btc(), feeds.subscribe(&btc()).unwrap())],
+        command_rx,
+        event_tx,
+        Metrics::new(),
+        shutdown.clone(),
+    ));
+    let handle = EngineHandle::new(command_tx);
+    let publisher = publishers.take(Venue::Hyperliquid).remove("BTC").unwrap();
+
+    publisher.book.send_replace(Some(Arc::new(BookView {
+        venue: Venue::Hyperliquid,
+        coin: "BTC".into(),
+        time: 1,
+        bids: vec![Level {
+            px: dec!(59_990),
+            sz: dec!(5),
+        }],
+        asks: vec![Level {
+            px: dec!(60_010),
+            sz: dec!(5),
+        }],
+        mid: Some(dec!(60_000)),
+    })));
+    publish(&publisher.mark, dec!(60_000));
+
+    let account = handle.create_account(dec!(3_000)).await.unwrap();
+    let view = tokio::time::timeout(WAIT, async {
+        loop {
+            match handle.fill(account.id, btc(), Side::Long, dec!(1)).await {
+                Ok(view) => return view,
+                Err(EngineError::NoMark(_)) => tokio::time::sleep(Duration::from_millis(5)).await,
+                Err(other) => panic!("fill failed: {other}"),
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for the first mark");
+    assert_eq!(view.positions[0].entry_px, dec!(60_010));
+
+    // A stale book is taken away, and the next fill is at the mark.
+    publisher.book.send_replace(None);
+    let view = handle
+        .fill(account.id, btc(), Side::Short, dec!(1))
+        .await
+        .unwrap();
+    assert!(view.positions.is_empty());
+    assert_eq!(view.collateral, dec!(2_990));
+
+    shutdown.cancel();
+    task.await.unwrap();
+    while events.recv().await.is_some() {}
 }

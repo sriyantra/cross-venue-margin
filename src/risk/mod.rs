@@ -2,8 +2,10 @@
 //!
 //! This module is pure: no I/O, no async, no clock. It takes an account, a
 //! set of mark prices and a maintenance schedule, and returns numbers. The
-//! margin model is gross: every position pays its own maintenance margin, and
-//! positions offset each other only through profit and loss in account equity.
+//! margin model starts gross: every position pays its own maintenance margin,
+//! and positions offset each other only through profit and loss in account
+//! equity. With a hedge rate in the schedule, a long and a short in the same
+//! coin on different venues are netted and pay that rate instead.
 //! Collateral can be dollars or coins. A coin counts at its mark price less
 //! a haircut, so the account's equity moves with the price of what it holds.
 
@@ -13,6 +15,7 @@ use thiserror::Error;
 pub mod health;
 pub mod lifecycle;
 pub mod liquidation;
+pub mod netting;
 mod num;
 pub mod schedule;
 pub mod types;
@@ -20,6 +23,7 @@ pub mod types;
 pub use health::{Health, account_health, asset_value};
 pub use lifecycle::{AccountState, ThresholdError, Thresholds, Transition, step};
 pub use liquidation::{LiquidationPrice, liquidation_price};
+pub use netting::{Requirement, matched_sizes, requirement};
 pub use schedule::{
     CollateralRule, MarginTable, Schedule, ScheduleError, SizeTable, SizeTier, Tier, TierTable,
 };

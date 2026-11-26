@@ -13,7 +13,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::info;
 
 use super::{AccountId, AccountView, Engine, EngineError, Event};
-use crate::feed::MarkRx;
+use crate::feed::{BookRx, MarkRx};
 use crate::metrics::Metrics;
 use crate::risk::{MarketId, Side};
 
@@ -137,6 +137,7 @@ async fn any_mark_changed(marks: &mut [Watched]) {
 pub async fn run(
     mut engine: Engine,
     marks: Vec<(MarketId, MarkRx)>,
+    books: Vec<(MarketId, BookRx)>,
     mut commands: mpsc::Receiver<Command>,
     events: mpsc::Sender<Event>,
     metrics: Metrics,
@@ -162,6 +163,19 @@ pub async fn run(
         };
         let now = now_ms();
         let mut out = Vec::new();
+
+        // The engine prices fills and liquidations off the latest books. A
+        // book change does not wake the task, so they are read here, before
+        // anything that could use them. A book that is stale or whose
+        // connector is gone is taken away.
+        for (market, rx) in &books {
+            let book = if rx.has_changed().is_err() {
+                None
+            } else {
+                rx.borrow().clone()
+            };
+            engine.set_depth(market.clone(), book);
+        }
 
         // Marks go first, so a command never runs against a mark the
         // connector has already replaced or withdrawn.

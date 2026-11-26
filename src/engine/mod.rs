@@ -9,16 +9,32 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
+use std::sync::Arc;
 
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::book::average_price;
+use crate::feed::BookView;
 use crate::risk::{
     Account, AccountState, CASH_ASSET, Health, LiquidationPrice, MarketId, Marks, Position,
     PositionError, RiskError, Schedule, Side, Thresholds, account_health, asset_value,
-    liquidation_price, step,
+    liquidation_price, matched_sizes, step,
 };
+
+/// The latest order book of each market the engine has been given one for.
+type Depths = BTreeMap<MarketId, Arc<BookView>>;
+
+/// The average price of trading `size` against a book: asks for a buy, bids
+/// for a sell.
+fn book_price(book: &BookView, side: Side, size: Decimal, partial: bool) -> Option<Decimal> {
+    let levels = match side {
+        Side::Long => &book.asks,
+        Side::Short => &book.bids,
+    };
+    average_price(levels, size, partial)
+}
 
 pub mod restore;
 pub mod task;
@@ -146,6 +162,8 @@ pub enum EngineError {
     PositionTooLarge { size: Decimal, max: Decimal },
     #[error("not enough margin for this fill")]
     InsufficientMargin,
+    #[error("the {market} book does not hold {size} on that side")]
+    InsufficientLiquidity { market: MarketId, size: Decimal },
     #[error("risk calculation failed: {0}")]
     Risk(RiskError),
     #[error("engine is not running")]
@@ -198,6 +216,9 @@ pub struct PositionView {
     pub market: MarketId,
     pub side: Side,
     pub size: Decimal,
+    /// The part of the size matched by an opposite position in the same
+    /// coin on another venue. It pays the hedge rate, not the venue's.
+    pub hedged_size: Decimal,
     pub entry_px: Decimal,
     pub mark: Option<Decimal>,
     pub unrealized_pnl: Option<Decimal>,
@@ -213,6 +234,7 @@ pub struct Engine {
     schedule: Schedule,
     thresholds: Thresholds,
     marks: Marks,
+    depths: Depths,
     accounts: BTreeMap<AccountId, Entry>,
     next_id: u64,
 }
@@ -223,6 +245,7 @@ impl Engine {
             schedule,
             thresholds,
             marks: Marks::new(),
+            depths: Depths::new(),
             accounts: BTreeMap::new(),
             next_id: 1,
         }
@@ -288,6 +311,7 @@ impl Engine {
             id,
             entry,
             &self.marks,
+            &self.depths,
             &self.schedule,
             &self.thresholds,
             now,
@@ -296,10 +320,26 @@ impl Engine {
         Ok(events)
     }
 
-    /// Fills a paper order at the market's current mark.
+    /// Gives the engine a market's current order book, or takes it away
+    /// when `book` is `None`. Nothing is re-evaluated: the book only prices
+    /// the fills and liquidations that come after.
+    pub fn set_depth(&mut self, market: MarketId, book: Option<Arc<BookView>>) {
+        match book {
+            Some(book) => self.depths.insert(market, book),
+            None => self.depths.remove(&market),
+        };
+    }
+
+    /// Fills a paper order.
     ///
-    /// A fill that leaves the position larger than it was is refused if it
-    /// would put the account in a margin call or worse. A fill that leaves
+    /// With a book for the market, the fill walks it: a buy takes asks and a
+    /// sell takes bids, level by level, and the fill price is the average.
+    /// An order larger than the side of the book is refused. Without a book
+    /// the fill is at the market's mark.
+    ///
+    /// A fill that leaves the position larger than it was is refused if the
+    /// account's equity would be below its initial margin requirement, or
+    /// if it would put the account in a margin call or worse. A fill that leaves
     /// it the same size or smaller is always accepted, including one that
     /// flips it to the other side. A refused fill changes nothing.
     pub fn fill(
@@ -318,10 +358,20 @@ impl Engine {
             return Err(EngineError::AccountClosed(id));
         }
         self.schedule.table(&market)?;
-        let px = *self
+        let mark = *self
             .marks
             .get(&market)
             .ok_or_else(|| EngineError::NoMark(market.clone()))?;
+        Position::new(side, size, mark)?;
+        let px = match self.depths.get(&market) {
+            Some(book) => book_price(book, side, size, false).ok_or_else(|| {
+                EngineError::InsufficientLiquidity {
+                    market: market.clone(),
+                    size,
+                }
+            })?,
+            None => mark,
+        };
         let fill = Position::new(side, size, px)?;
 
         // Work on a copy, and only keep it if the result is acceptable.
@@ -339,7 +389,10 @@ impl Engine {
         };
         if grows {
             let health = account_health(&account, &self.marks, &self.schedule)?;
-            if health.is_liquidatable() || self.thresholds.in_margin_call(&health)? {
+            if health.equity < health.initial_required
+                || health.is_liquidatable()
+                || self.thresholds.in_margin_call(&health)?
+            {
                 return Err(EngineError::InsufficientMargin);
             }
         }
@@ -358,6 +411,7 @@ impl Engine {
             id,
             entry,
             &self.marks,
+            &self.depths,
             &self.schedule,
             &self.thresholds,
             now,
@@ -387,6 +441,7 @@ impl Engine {
                     *id,
                     entry,
                     &self.marks,
+                    &self.depths,
                     &self.schedule,
                     &self.thresholds,
                     now,
@@ -400,6 +455,7 @@ impl Engine {
     pub fn view(&self, id: AccountId) -> Option<AccountView> {
         let entry = self.accounts.get(&id)?;
         let account = &entry.account;
+        let matched = matched_sizes(account, &self.schedule).unwrap_or_default();
         let positions = account
             .positions()
             .map(|(market, position)| {
@@ -408,6 +464,7 @@ impl Engine {
                     market: market.clone(),
                     side: position.side(),
                     size: position.size(),
+                    hedged_size: matched.get(market).copied().unwrap_or(Decimal::ZERO),
                     entry_px: position.entry_px(),
                     mark,
                     unrealized_pnl: mark.and_then(|px| position.unrealized_pnl(px).ok()),
@@ -447,16 +504,18 @@ impl Engine {
 
 /// Brings one account's state in line with the current marks, liquidating
 /// it if it has fallen below maintenance margin.
+#[allow(clippy::too_many_arguments)]
 fn reassess(
     id: AccountId,
     entry: &mut Entry,
     marks: &Marks,
+    depths: &Depths,
     schedule: &Schedule,
     thresholds: &Thresholds,
     now: u64,
     events: &mut Vec<Event>,
 ) {
-    match try_reassess(id, entry, marks, schedule, thresholds, now, events) {
+    match try_reassess(id, entry, marks, depths, schedule, thresholds, now, events) {
         // With a mark missing there is no health to act on. The account
         // keeps its state until every mark is back.
         Ok(()) | Err(RiskError::MissingMark(_)) => {}
@@ -468,10 +527,12 @@ fn reassess(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn try_reassess(
     id: AccountId,
     entry: &mut Entry,
     marks: &Marks,
+    depths: &Depths,
     schedule: &Schedule,
     thresholds: &Thresholds,
     now: u64,
@@ -495,7 +556,21 @@ fn try_reassess(
 
     advance(entry, events)?;
     if matches!(entry.state, AccountState::Liquidating { .. }) {
-        for closed in entry.account.close_all(marks)? {
+        // A long is closed by selling into the bids and a short by buying
+        // from the asks. Size the book cannot fill is priced at its last
+        // level. A market with no book closes at its mark.
+        let exit = |market: &MarketId, position: &Position| {
+            let mark = crate::risk::health::mark_for(marks, market)?;
+            let closing = match position.side() {
+                Side::Long => Side::Short,
+                Side::Short => Side::Long,
+            };
+            Ok(depths
+                .get(market)
+                .and_then(|book| book_price(book, closing, position.size(), true))
+                .unwrap_or(mark))
+        };
+        for closed in entry.account.close_all_at(exit)? {
             events.push(Event::Liquidated {
                 account: id,
                 market: closed.market,
@@ -561,7 +636,7 @@ mod tests {
     #[test]
     fn one_venue_moving_liquidates_positions_on_both() {
         let mut engine = two_venue_engine();
-        let (id, _) = engine.create_account(dec!(20_000), 1).unwrap();
+        let (id, _) = engine.create_account(dec!(22_000), 1).unwrap();
         engine
             .fill(id, market("BTC"), Side::Long, dec!(10), 2)
             .unwrap();
@@ -573,7 +648,7 @@ mod tests {
         assert_eq!(health.maintenance_required, dec!(9_900));
 
         // Only the short's venue moves. The long gains nothing to offset it.
-        let events = engine.set_mark(okx_btc(), Some(dec!(61_200)), 4);
+        let events = engine.set_mark(okx_btc(), Some(dec!(61_300)), 4);
         let closed: Vec<_> = events
             .iter()
             .filter_map(|event| match event {
@@ -583,11 +658,11 @@ mod tests {
             .collect();
         assert_eq!(
             closed,
-            [(market("BTC"), dec!(60_000)), (okx_btc(), dec!(61_200))]
+            [(market("BTC"), dec!(60_000)), (okx_btc(), dec!(61_300))]
         );
         let view = engine.view(id).unwrap();
         assert!(matches!(view.state, AccountState::Closed { .. }));
-        assert_eq!(view.collateral, dec!(8_000));
+        assert_eq!(view.collateral, dec!(9_000));
     }
 
     /// The two-venue engine, accepting BTC as collateral at a 10% haircut
@@ -723,8 +798,8 @@ mod tests {
         let (id, _) = engine.create_account(dec!(0), 1).unwrap();
         engine.deposit(id, "BTC", dec!(0.05), 2).unwrap();
         // The only position is on OKX. The collateral is priced on Hyperliquid.
-        engine.fill(id, okx_btc(), Side::Long, dec!(5), 3).unwrap();
-        // 2,700 of equity against 1,200 of maintenance.
+        engine.fill(id, okx_btc(), Side::Long, dec!(4), 3).unwrap();
+        // 2,700 of equity against 960 of maintenance.
         assert_eq!(engine.view(id).unwrap().state, AccountState::Open);
 
         // Hyperliquid falls. The OKX mark has not moved, so the position has
@@ -785,6 +860,157 @@ mod tests {
                 at: 11
             }
         );
+    }
+
+    #[test]
+    fn a_hedge_across_venues_pays_the_hedge_rate() {
+        let hedged = |hedge_rate| {
+            let mut engine = two_venue_engine();
+            engine.schedule.set_hedge_rate(hedge_rate).unwrap();
+            let (id, _) = engine.create_account(dec!(22_000), 1).unwrap();
+            engine
+                .fill(id, market("BTC"), Side::Long, dec!(10), 2)
+                .unwrap();
+            engine
+                .fill(id, okx_btc(), Side::Short, dec!(10), 3)
+                .unwrap();
+            (engine, id)
+        };
+
+        let (mut gross, a) = hedged(None);
+        let (mut net, b) = hedged(Some(dec!(0.0025)));
+        // 600,000 at 1.25% plus 600,000 at 0.4%, against 0.25% on each leg.
+        let health = |engine: &Engine, id| engine.view(id).unwrap().health.unwrap();
+        assert_eq!(health(&gross, a).maintenance_required, dec!(9_900));
+        assert_eq!(health(&net, b).maintenance_required, dec!(3_000));
+        assert_eq!(health(&net, b).initial_required, dec!(6_000));
+        let view = net.view(b).unwrap();
+        assert_eq!(view.positions[0].hedged_size, dec!(10));
+        assert_eq!(view.positions[1].hedged_size, dec!(10));
+        assert_eq!(gross.view(a).unwrap().positions[0].hedged_size, dec!(0));
+
+        // The two venues' marks drift 1,300 apart. Both accounts lose
+        // 13,000. Only the gross one is below its requirement.
+        let liquidated = |events: Vec<Event>| {
+            events
+                .iter()
+                .any(|event| matches!(event, Event::Liquidated { .. }))
+        };
+        assert!(liquidated(gross.set_mark(okx_btc(), Some(dec!(61_300)), 4)));
+        assert!(!liquidated(net.set_mark(okx_btc(), Some(dec!(61_300)), 4)));
+        // The gap reaches 1,900 and the hedge rate no longer covers it.
+        assert!(liquidated(net.set_mark(okx_btc(), Some(dec!(61_900)), 5)));
+    }
+
+    #[test]
+    fn the_unhedged_part_of_a_position_pays_its_venue_table() {
+        let mut engine = two_venue_engine();
+        engine.schedule.set_hedge_rate(Some(dec!(0.0025))).unwrap();
+        let (id, _) = engine.create_account(dec!(50_000), 1).unwrap();
+        engine
+            .fill(id, market("BTC"), Side::Long, dec!(10), 2)
+            .unwrap();
+        engine.fill(id, okx_btc(), Side::Short, dec!(4), 3).unwrap();
+        let view = engine.view(id).unwrap();
+        assert_eq!(view.positions[0].hedged_size, dec!(4));
+        // Matched: 240,000 at 0.25% on each leg. Outright: 360,000 at 1.25%.
+        assert_eq!(view.health.unwrap().maintenance_required, dec!(5_700));
+    }
+
+    #[test]
+    fn a_fill_needs_initial_margin_at_max_leverage() {
+        let (mut engine, id) = long_btc();
+        // 3,000 of equity. Initial margin is 2.5%, so 120,000 is the most
+        // it carries: 2 BTC. A margin call would not start until 2.66 BTC.
+        assert_eq!(
+            engine.fill(id, market("BTC"), Side::Long, dec!(1.01), 3),
+            Err(EngineError::InsufficientMargin)
+        );
+        engine
+            .fill(id, market("BTC"), Side::Long, dec!(1), 4)
+            .unwrap();
+        let health = engine.view(id).unwrap().health.unwrap();
+        assert_eq!(health.initial_required, dec!(3_000));
+        assert_eq!(health.maintenance_required, dec!(1_500));
+    }
+
+    fn book(bids: &[(Decimal, Decimal)], asks: &[(Decimal, Decimal)]) -> Arc<BookView> {
+        let levels = |side: &[(Decimal, Decimal)]| {
+            side.iter()
+                .map(|&(px, sz)| crate::book::Level { px, sz })
+                .collect()
+        };
+        Arc::new(BookView {
+            venue: Venue::Hyperliquid,
+            coin: "BTC".into(),
+            time: 0,
+            bids: levels(bids),
+            asks: levels(asks),
+            mid: None,
+        })
+    }
+
+    #[test]
+    fn fills_and_liquidations_walk_the_book() {
+        let mut engine = engine();
+        engine.set_mark(market("BTC"), Some(dec!(60_000)), 0);
+        engine.set_depth(
+            market("BTC"),
+            Some(book(
+                &[(dec!(59_990), dec!(0.5)), (dec!(59_980), dec!(1))],
+                &[(dec!(60_010), dec!(0.5)), (dec!(60_020), dec!(1))],
+            )),
+        );
+        let (id, _) = engine.create_account(dec!(3_000), 1).unwrap();
+
+        // The asks hold 1.5.
+        assert_eq!(
+            engine.fill(id, market("BTC"), Side::Long, dec!(2), 2),
+            Err(EngineError::InsufficientLiquidity {
+                market: market("BTC"),
+                size: dec!(2)
+            })
+        );
+        // 0.5 at 60,010 and 0.5 at 60,020.
+        let events = engine
+            .fill(id, market("BTC"), Side::Long, dec!(1), 3)
+            .unwrap();
+        assert!(matches!(events[0], Event::Filled { px, .. } if px == dec!(60_015)));
+        let view = engine.view(id).unwrap();
+        assert_eq!(view.positions[0].entry_px, dec!(60_015));
+        // The cost of crossing the spread shows as a loss at the mark.
+        assert_eq!(view.positions[0].unrealized_pnl, Some(dec!(-15)));
+
+        // The bids thin out, and then the mark falls through maintenance.
+        // The long is sold into what is there: 0.4 at 57,600, and the 0.6
+        // the book cannot take at that same last level.
+        engine.set_depth(
+            market("BTC"),
+            Some(book(
+                &[(dec!(57_600), dec!(0.4))],
+                &[(dec!(57_700), dec!(1))],
+            )),
+        );
+        let events = engine.set_mark(market("BTC"), Some(dec!(57_700)), 10);
+        let closed: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                Event::Liquidated {
+                    px, realized_pnl, ..
+                } => Some((*px, *realized_pnl)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(closed, [(dec!(57_600), dec!(-2_415))]);
+        assert_eq!(engine.view(id).unwrap().collateral, dec!(585));
+
+        // With the book taken away, fills go back to the mark.
+        engine.set_depth(market("BTC"), None);
+        let (id, _) = engine.create_account(dec!(3_000), 11).unwrap();
+        let events = engine
+            .fill(id, market("BTC"), Side::Long, dec!(1), 12)
+            .unwrap();
+        assert!(matches!(events[0], Event::Filled { px, .. } if px == dec!(57_700)));
     }
 
     #[test]

@@ -95,6 +95,7 @@ async fn main() -> Result<()> {
             schedule.insert_collateral(coin.as_str(), CollateralRule::new(price, haircut)?);
         }
     }
+    schedule.set_hedge_rate(config.hedge_margin_rate)?;
     let thresholds = Thresholds::new(config.margin_call_multiple)?;
     let (engine, store) = match &config.database_url {
         Some(url) => {
@@ -116,6 +117,10 @@ async fn main() -> Result<()> {
         .mark_receivers()
         .map(|(market, rx)| (market.clone(), rx))
         .collect();
+    let books = feeds
+        .book_receivers()
+        .map(|(market, rx)| (market.clone(), rx))
+        .collect();
     let (command_tx, command_rx) = mpsc::channel(COMMAND_QUEUE);
     let (event_tx, event_rx) = mpsc::channel(EVENT_QUEUE);
 
@@ -134,6 +139,7 @@ async fn main() -> Result<()> {
     let risk = tokio::spawn(task::run(
         engine,
         marks,
+        books,
         command_rx,
         event_tx,
         metrics.clone(),

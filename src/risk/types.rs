@@ -265,10 +265,25 @@ impl Account {
     /// Closes every position at its market's mark and moves the result into
     /// collateral. On an error the account is unchanged.
     pub fn close_all(&mut self, marks: &Marks) -> Result<Vec<Closed>, RiskError> {
+        self.close_all_at(|market, _| mark_for(marks, market))
+    }
+
+    /// Closes every position at the price `exit` gives for it and moves the
+    /// result into collateral. On an error the account is unchanged.
+    pub fn close_all_at(
+        &mut self,
+        exit: impl Fn(&MarketId, &Position) -> Result<Decimal, RiskError>,
+    ) -> Result<Vec<Closed>, RiskError> {
         let mut closed = Vec::with_capacity(self.positions.len());
         let mut collateral = self.collateral;
         for (market, position) in &self.positions {
-            let px = mark_for(marks, market)?;
+            let px = exit(market, position)?;
+            if px <= Decimal::ZERO {
+                return Err(RiskError::InvalidMark {
+                    market: market.clone(),
+                    mark: px,
+                });
+            }
             let realized_pnl = position.unrealized_pnl(px)?;
             collateral = add(collateral, realized_pnl)?;
             closed.push(Closed {
