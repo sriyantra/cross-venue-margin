@@ -2,6 +2,7 @@ FROM rust:1.100-trixie AS build
 WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
+COPY benches ./benches
 COPY migrations ./migrations
 RUN cargo build --release --locked --bin cross-venue-margin
 
