@@ -40,6 +40,8 @@ pub struct OrderWire {
     /// Reduce only.
     pub r: bool,
     pub t: OrderType,
+    /// The sender's own id for the order, which the venue keeps with it.
+    pub c: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -64,7 +66,8 @@ pub struct OrderAction {
 
 impl OrderAction {
     /// One order that fills what it can at once and cancels the rest.
-    pub fn immediate(asset: u32, buy: bool, px: String, size: String) -> Self {
+    /// `order` is the sender's id for it.
+    pub fn immediate(asset: u32, buy: bool, px: String, size: String, order: u64) -> Self {
         Self {
             kind: "order",
             orders: vec![OrderWire {
@@ -76,10 +79,17 @@ impl OrderAction {
                 t: OrderType {
                     limit: Limit { tif: "Ioc" },
                 },
+                c: client_id(order),
             }],
             grouping: "na",
         }
     }
+}
+
+/// An order id the way the venue wants a client's id written: 16 bytes
+/// of hex.
+pub fn client_id(order: u64) -> String {
+    format!("0x{order:032x}")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -182,7 +192,7 @@ mod tests {
     const NONCE: u64 = 1_700_000_000_000;
 
     fn action() -> OrderAction {
-        OrderAction::immediate(3, true, "64560".into(), "0.001".into())
+        OrderAction::immediate(3, true, "64560".into(), "0.001".into(), NONCE)
     }
 
     #[test]
@@ -199,9 +209,10 @@ mod tests {
         let packed = rmp_serde::to_vec_named(&action()).unwrap();
         assert_eq!(
             hex::encode(packed),
-            "83a474797065a56f72646572a66f72646572739186a16103a162c3a170a53634353630\
-             a173a5302e303031a172c2a17481a56c696d697481a3746966a3496f63a867726f7570\
-             696e67a26e61"
+            "83a474797065a56f72646572a66f72646572739187a16103a162c3a170a53634353630\
+             a173a5302e303031a172c2a17481a56c696d697481a3746966a3496f63a163d9223078\
+             3030303030303030303030303030303030303030303138626366653536383030a86772\
+             6f7570696e67a26e61"
         );
     }
 
@@ -209,7 +220,7 @@ mod tests {
     fn action_hash_matches_the_reference_client() {
         assert_eq!(
             hex::encode(action_hash(&action(), NONCE).unwrap()),
-            "1aba42f8d997eeedf6805a459c8b0660d00e1b5b350dcbb6f400fb70cad7b918"
+            "193d76ccff859834f92fd26e19db78a6decd4191f2b1cea0280f57baff1fb872"
         );
     }
 
@@ -222,8 +233,8 @@ mod tests {
         assert_eq!(
             signature,
             Signature {
-                r: "0xc6c91a6f97afc914c9a19fbb33b23a77d57f23bbb03d248722c1b735a81e1c3a".into(),
-                s: "0x661ebd6d31690d5eee1ec4f8c262bf16a162ea4f6d86d533c5596dbf92f03cf9".into(),
+                r: "0xf9fab368b34da14edd9b8c43a2ad956993e1f245cb79f19cf249184a4d6bd70f".into(),
+                s: "0x133a3cddb9bbd74e3836ba840a8fc1b2ade9ec922be41323bbfb06bc1dffa00d".into(),
                 v: 27,
             }
         );

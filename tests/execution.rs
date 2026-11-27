@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use axum::extract::State;
+use axum::http::StatusCode;
 use axum::routing::post;
 use axum::{Json, Router};
 use cross_venue_margin::engine::Engine;
@@ -28,7 +29,27 @@ const ADDRESS: &str = "0x1a642f0e3c3af545e7acbd38b07251b3990914f1";
 struct StandIn {
     orders: Vec<Value>,
     order_reply: Value,
+    /// When set, an order is taken and its answer never gets back.
+    lose_reply: bool,
     position: &'static str,
+    /// Requests for the status of an order, and the answer to them.
+    lookups: Vec<Value>,
+    status: Value,
+    fills: Value,
+}
+
+impl StandIn {
+    fn new(order_reply: Value) -> Shared {
+        Arc::new(Mutex::new(Self {
+            orders: Vec::new(),
+            order_reply,
+            lose_reply: false,
+            position: "0.0",
+            lookups: Vec::new(),
+            status: json!({"status": "unknownOid"}),
+            fills: json!([]),
+        }))
+    }
 }
 
 type Shared = Arc<Mutex<StandIn>>;
@@ -53,19 +74,38 @@ async fn info(State(venue): State<Shared>, Json(body): Json<Value>) -> Json<Valu
                 "assetPositions": [{"position": {"coin": "BTC", "szi": position}}]
             }))
         }
+        Some("orderStatus") => {
+            assert_eq!(body["user"], ADDRESS);
+            let mut venue = venue.lock().unwrap();
+            venue.lookups.push(body);
+            Json(venue.status.clone())
+        }
+        Some("userFillsByTime") => {
+            assert_eq!(body["user"], ADDRESS);
+            assert!(body["startTime"].as_u64().unwrap() > 0);
+            Json(venue.lock().unwrap().fills.clone())
+        }
         other => panic!("unexpected info request {other:?}"),
     }
 }
 
-async fn exchange(State(venue): State<Shared>, Json(body): Json<Value>) -> Json<Value> {
+async fn exchange(
+    State(venue): State<Shared>,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, StatusCode> {
     let mut venue = venue.lock().unwrap();
     venue.orders.push(body);
-    Json(venue.order_reply.clone())
+    if venue.lose_reply {
+        return Err(StatusCode::GATEWAY_TIMEOUT);
+    }
+    Ok(Json(venue.order_reply.clone()))
 }
 
 struct Harness {
     api: String,
     venue: Shared,
+    engine: EngineHandle,
+    executor: Arc<Executor>,
     http: reqwest::Client,
     _shutdown: tokio_util::sync::DropGuard,
 }
@@ -78,11 +118,7 @@ async fn listen(router: Router) -> SocketAddr {
 }
 
 async fn start(order_reply: Value) -> Harness {
-    let venue: Shared = Arc::new(Mutex::new(StandIn {
-        orders: Vec::new(),
-        order_reply,
-        position: "0.0",
-    }));
+    let venue = StandIn::new(order_reply);
     let venue_addr = listen(
         Router::new()
             .route("/info", post(info))
@@ -94,6 +130,7 @@ async fn start(order_reply: Value) -> Harness {
         .await
         .unwrap();
     assert_eq!(executor.address(), ADDRESS);
+    let executor = Arc::new(executor);
 
     let markets = [
         MarketId::new(Venue::Hyperliquid, "BTC"),
@@ -136,17 +173,20 @@ async fn start(order_reply: Value) -> Harness {
     ));
     tokio::spawn(async move { while events.recv().await.is_some() {} });
 
+    let engine = EngineHandle::new(command_tx);
     let api = listen(server::router(
         feeds,
-        EngineHandle::new(command_tx),
+        engine.clone(),
         Metrics::new(),
         false,
-        Some(Arc::new(executor)),
+        Some(executor.clone()),
     ))
     .await;
     Harness {
         api: format!("http://{api}"),
         venue,
+        engine,
+        executor,
         http: reqwest::Client::builder().timeout(WAIT).build().unwrap(),
         _shutdown: shutdown.drop_guard(),
     }
@@ -203,6 +243,16 @@ impl Harness {
     fn orders(&self) -> Vec<Value> {
         self.venue.lock().unwrap().orders.clone()
     }
+
+    async fn repair(&self) {
+        execution::repair(&self.engine, &self.executor).await;
+    }
+
+    async fn open_orders(&self) -> Value {
+        let (status, report) = self.get("/venues/hyperliquid/reconciliation").await;
+        assert_eq!(status, 200);
+        report["open_orders"].clone()
+    }
 }
 
 #[tokio::test]
@@ -220,15 +270,18 @@ async fn a_fill_is_sent_to_the_venue_and_recorded_as_the_venue_filled_it() {
     let orders = harness.orders();
     assert_eq!(orders.len(), 1);
     // BTC is the second market the venue lists. The limit is 5% above the
-    // mark, and the order cancels what does not fill at once.
+    // mark, and the order cancels what does not fill at once. Its id is
+    // its nonce.
+    let nonce = orders[0]["nonce"].as_u64().unwrap();
+    assert!(nonce > 0);
     assert_eq!(
         orders[0]["action"],
         json!({"type": "order", "grouping": "na", "orders": [{
             "a": 1, "b": true, "p": "63000", "s": "0.02", "r": false,
-            "t": {"limit": {"tif": "Ioc"}}
+            "t": {"limit": {"tif": "Ioc"}}, "c": format!("0x{nonce:032x}")
         }]})
     );
-    assert!(orders[0]["nonce"].as_u64().unwrap() > 0);
+    assert!(harness.open_orders().await.as_array().unwrap().is_empty());
     assert!(
         orders[0]["signature"]["r"]
             .as_str()
@@ -261,6 +314,112 @@ async fn an_order_the_venue_refuses_changes_nothing() {
     assert!(reply["error"].as_str().unwrap().contains("minimum value"));
     assert_eq!(harness.orders().len(), 1);
 
+    let (_, account) = harness.get(&format!("/accounts/{id}")).await;
+    assert_eq!(account["positions"], json!([]));
+}
+
+#[tokio::test]
+async fn a_fill_whose_answer_was_lost_is_recorded_by_repair() {
+    let harness = start(filled("0.02", "60100.0")).await;
+    let id = harness.open("5000").await;
+    harness.venue.lock().unwrap().lose_reply = true;
+
+    // The venue took the order. The answer did not come back.
+    let (status, reply) = harness.fill(id, "hyperliquid", "long", "0.02").await;
+    assert_eq!(status, 502, "{reply}");
+    let (_, account) = harness.get(&format!("/accounts/{id}")).await;
+    assert_eq!(account["positions"], json!([]));
+    let nonce = harness.orders()[0]["nonce"].as_u64().unwrap();
+    let open = harness.open_orders().await;
+    assert_eq!(open.as_array().unwrap().len(), 1);
+    assert_eq!(open[0]["order"], nonce);
+    assert_eq!(open[0]["account"], id);
+    assert_eq!(open[0]["size"], "0.02");
+
+    // Until the order is settled the account takes no other fill, on
+    // either venue, and nothing more is sent.
+    let (status, reply) = harness.fill(id, "okx", "short", "0.01").await;
+    assert_eq!(status, 409, "{reply}");
+    let (status, _) = harness.fill(id, "hyperliquid", "long", "0.01").await;
+    assert_eq!(status, 409);
+    assert_eq!(harness.orders().len(), 1);
+
+    // An order the venue does not know yet is left open.
+    harness.repair().await;
+    assert_eq!(harness.open_orders().await.as_array().unwrap().len(), 1);
+    let lookups = harness.venue.lock().unwrap().lookups.clone();
+    assert_eq!(lookups[0]["oid"], format!("0x{nonce:032x}"));
+
+    // The venue reports it filled, in two parts. A fill of another order
+    // is not counted.
+    {
+        let mut venue = harness.venue.lock().unwrap();
+        venue.status = json!({"status": "order", "order": {
+            "order": {"coin": "BTC", "oid": 42, "origSz": "0.02", "sz": "0.0"},
+            "status": "filled"
+        }});
+        venue.fills = json!([
+            {"coin": "BTC", "oid": 42, "px": "60100.0", "sz": "0.005"},
+            {"coin": "BTC", "oid": 7, "px": "1.0", "sz": "3"},
+            {"coin": "BTC", "oid": 42, "px": "60200.0", "sz": "0.015"}
+        ]);
+    }
+    harness.repair().await;
+    let (_, account) = harness.get(&format!("/accounts/{id}")).await;
+    assert_eq!(account["positions"][0]["size"], "0.02");
+    assert_eq!(account["positions"][0]["entry_px"], "60175");
+    assert!(harness.open_orders().await.as_array().unwrap().is_empty());
+
+    // Settled once: another round changes nothing.
+    harness.repair().await;
+    let (_, again) = harness.get(&format!("/accounts/{id}")).await;
+    assert_eq!(again["positions"], account["positions"]);
+}
+
+#[tokio::test]
+async fn a_lost_order_the_venue_did_not_fill_is_dropped_by_repair() {
+    let harness = start(filled("0.02", "60100.0")).await;
+    let id = harness.open("5000").await;
+    {
+        let mut venue = harness.venue.lock().unwrap();
+        venue.lose_reply = true;
+        venue.status = json!({"status": "order", "order": {
+            "order": {"coin": "BTC", "oid": 42, "origSz": "0.02", "sz": "0.02"},
+            "status": "canceled"
+        }});
+    }
+    let (status, _) = harness.fill(id, "hyperliquid", "long", "0.02").await;
+    assert_eq!(status, 502);
+
+    harness.repair().await;
+    assert!(harness.open_orders().await.as_array().unwrap().is_empty());
+    let (_, account) = harness.get(&format!("/accounts/{id}")).await;
+    assert_eq!(account["positions"], json!([]));
+
+    // The account trades again.
+    harness.venue.lock().unwrap().lose_reply = false;
+    let (status, account) = harness.fill(id, "hyperliquid", "long", "0.02").await;
+    assert_eq!(status, 200, "{account}");
+}
+
+#[tokio::test]
+async fn a_filled_order_whose_fills_are_not_listed_yet_stays_open() {
+    let harness = start(filled("0.02", "60100.0")).await;
+    let id = harness.open("5000").await;
+    {
+        let mut venue = harness.venue.lock().unwrap();
+        venue.lose_reply = true;
+        venue.status = json!({"status": "order", "order": {
+            "order": {"coin": "BTC", "oid": 42, "origSz": "0.02", "sz": "0.0"},
+            "status": "filled"
+        }});
+        venue.fills = json!([{"coin": "BTC", "oid": 42, "px": "60100.0", "sz": "0.005"}]);
+    }
+    let (status, _) = harness.fill(id, "hyperliquid", "long", "0.02").await;
+    assert_eq!(status, 502);
+
+    harness.repair().await;
+    assert_eq!(harness.open_orders().await.as_array().unwrap().len(), 1);
     let (_, account) = harness.get(&format!("/accounts/{id}")).await;
     assert_eq!(account["positions"], json!([]));
 }
@@ -304,7 +463,8 @@ async fn reconciliation_compares_the_accounts_with_the_wallet() {
             "address": ADDRESS,
             "account_value": "110.0",
             "matched": true,
-            "coins": [{"coin": "BTC", "engine": "0.02", "venue": "0.02", "difference": "0"}]
+            "coins": [{"coin": "BTC", "engine": "0.02", "venue": "0.02", "difference": "0"}],
+            "open_orders": []
         })
     );
 
@@ -317,11 +477,7 @@ async fn reconciliation_compares_the_accounts_with_the_wallet() {
 
 #[tokio::test]
 async fn a_liquidated_long_is_sold_on_the_venue() {
-    let venue: Shared = Arc::new(Mutex::new(StandIn {
-        orders: Vec::new(),
-        order_reply: filled("0.5", "59900.0"),
-        position: "0.0",
-    }));
+    let venue = StandIn::new(filled("0.5", "59900.0"));
     let addr = listen(
         Router::new()
             .route("/info", post(info))

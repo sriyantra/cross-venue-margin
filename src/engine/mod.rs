@@ -80,6 +80,31 @@ pub enum Event {
         /// balance. Absent from the JSON when zero.
         #[serde(default, skip_serializing_if = "Decimal::is_zero")]
         fee: Decimal,
+        /// The order this fill answers. Absent for a paper fill.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        order: Option<u64>,
+        /// The venue's own id for that order.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        venue_order: Option<u64>,
+        at: u64,
+    },
+    /// An order about to go to a venue, at the price the engine expects.
+    /// It is logged before it is sent, so that an order whose answer never
+    /// arrives can be asked after.
+    OrderSent {
+        account: AccountId,
+        #[serde(flatten)]
+        market: MarketId,
+        side: Side,
+        size: Decimal,
+        px: Decimal,
+        order: u64,
+        at: u64,
+    },
+    /// The venue filled none of an order.
+    OrderDropped {
+        account: AccountId,
+        order: u64,
         at: u64,
     },
     StateChanged {
@@ -127,6 +152,8 @@ impl Event {
             Event::AccountOpened { account, .. }
             | Event::CollateralDeposited { account, .. }
             | Event::Filled { account, .. }
+            | Event::OrderSent { account, .. }
+            | Event::OrderDropped { account, .. }
             | Event::StateChanged { account, .. }
             | Event::Liquidated { account, .. }
             | Event::Funding { account, .. }
@@ -140,6 +167,8 @@ impl Event {
             Event::AccountOpened { at, .. }
             | Event::CollateralDeposited { at, .. }
             | Event::Filled { at, .. }
+            | Event::OrderSent { at, .. }
+            | Event::OrderDropped { at, .. }
             | Event::StateChanged { at, .. }
             | Event::Liquidated { at, .. }
             | Event::Funding { at, .. }
@@ -153,6 +182,8 @@ impl Event {
             Event::AccountOpened { .. } => "account_opened",
             Event::CollateralDeposited { .. } => "collateral_deposited",
             Event::Filled { .. } => "filled",
+            Event::OrderSent { .. } => "order_sent",
+            Event::OrderDropped { .. } => "order_dropped",
             Event::StateChanged { .. } => "state_changed",
             Event::Liquidated { .. } => "liquidated",
             Event::Funding { .. } => "funding",
@@ -185,6 +216,12 @@ pub enum EngineError {
     InsufficientMargin,
     #[error("the {market} book does not hold {size} on that side")]
     InsufficientLiquidity { market: MarketId, size: Decimal },
+    #[error("account {0} has an order the venue has not answered")]
+    OrderPending(AccountId),
+    #[error("order {0} was already sent")]
+    DuplicateOrder(u64),
+    #[error("no order {0} is waiting for an answer")]
+    UnknownOrder(u64),
     #[error("risk calculation failed: {0}")]
     Risk(RiskError),
     #[error("engine is not running")]
@@ -258,6 +295,21 @@ pub struct Funding {
     pub settles_at: u64,
 }
 
+/// An order that went to a venue and has not been answered.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct OpenOrder {
+    pub order: u64,
+    pub account: AccountId,
+    #[serde(flatten)]
+    pub market: MarketId,
+    pub side: Side,
+    pub size: Decimal,
+    /// The price the engine expected it to fill at.
+    pub px: Decimal,
+    /// Milliseconds since the epoch.
+    pub sent_at: u64,
+}
+
 struct Entry {
     account: Account,
     state: AccountState,
@@ -271,6 +323,8 @@ pub struct Engine {
     /// The next funding settlement of each market that has one coming.
     fundings: BTreeMap<MarketId, Funding>,
     accounts: BTreeMap<AccountId, Entry>,
+    /// Orders sent to a venue and not yet answered, by order id.
+    orders: BTreeMap<u64, OpenOrder>,
     next_id: u64,
 }
 
@@ -283,6 +337,7 @@ impl Engine {
             depths: Depths::new(),
             fundings: BTreeMap::new(),
             accounts: BTreeMap::new(),
+            orders: BTreeMap::new(),
             next_id: 1,
         }
     }
@@ -463,39 +518,96 @@ impl Engine {
         now: u64,
     ) -> Result<Vec<Event>, EngineError> {
         let priced = self.priced(id, &market, side, size, None)?;
-        self.commit(id, priced, market, side, size, now)
+        self.commit(id, priced, market, side, size, None, now)
     }
 
-    /// Says whether `fill` would accept this order, without changing
-    /// anything, and returns the price it would fill at. An order that is
-    /// about to be sent to a venue is checked here first.
-    pub fn check_fill(
-        &self,
+    /// Notes an order that is about to be sent to a venue, and returns the
+    /// price the engine expects it to fill at. The order has to pass
+    /// everything `fill` would ask of it, so an order the account cannot
+    /// carry never reaches the venue. Positions do not change yet.
+    ///
+    /// `order` is the caller's id for it, new for every order. Until the
+    /// order is answered with `record_fill` or `drop_order`, the account
+    /// takes no other fill.
+    pub fn send_order(
+        &mut self,
         id: AccountId,
-        market: &MarketId,
+        market: MarketId,
         side: Side,
         size: Decimal,
-    ) -> Result<Decimal, EngineError> {
-        self.priced(id, market, side, size, None)
-            .map(|priced| priced.px)
+        order: u64,
+        now: u64,
+    ) -> Result<(Decimal, Vec<Event>), EngineError> {
+        if self.orders.contains_key(&order) {
+            return Err(EngineError::DuplicateOrder(order));
+        }
+        let px = self.priced(id, &market, side, size, None)?.px;
+        self.orders.insert(
+            order,
+            OpenOrder {
+                order,
+                account: id,
+                market: market.clone(),
+                side,
+                size,
+                px,
+                sent_at: now,
+            },
+        );
+        let event = Event::OrderSent {
+            account: id,
+            market,
+            side,
+            size,
+            px,
+            order,
+            at: now,
+        };
+        Ok((px, vec![event]))
     }
 
-    /// Records a fill that a venue has already made, at the venue's price.
+    /// Records what the venue filled of an order, at the venue's price.
+    /// `venue_order` is the venue's id for it.
     ///
     /// The margin rules are not applied: the position exists on the venue
     /// whether or not this account can carry it. If it cannot, the
     /// reassessment that follows deals with it like any other loss.
     pub fn record_fill(
         &mut self,
-        id: AccountId,
-        market: MarketId,
-        side: Side,
+        order: u64,
         size: Decimal,
         px: Decimal,
+        venue_order: u64,
         now: u64,
-    ) -> Result<Vec<Event>, EngineError> {
+    ) -> Result<(AccountId, Vec<Event>), EngineError> {
+        let open = self
+            .orders
+            .get(&order)
+            .ok_or(EngineError::UnknownOrder(order))?;
+        let (id, market, side) = (open.account, open.market.clone(), open.side);
         let priced = self.priced(id, &market, side, size, Some(px))?;
-        self.commit(id, priced, market, side, size, now)
+        self.orders.remove(&order);
+        let ids = Some((order, venue_order));
+        let events = self.commit(id, priced, market, side, size, ids, now)?;
+        Ok((id, events))
+    }
+
+    /// Forgets an order the venue filled none of.
+    pub fn drop_order(&mut self, order: u64, now: u64) -> Result<Vec<Event>, EngineError> {
+        let open = self
+            .orders
+            .remove(&order)
+            .ok_or(EngineError::UnknownOrder(order))?;
+        Ok(vec![Event::OrderDropped {
+            account: open.account,
+            order,
+            at: now,
+        }])
+    }
+
+    /// Every order that has not been answered, oldest id first.
+    pub fn open_orders(&self) -> Vec<OpenOrder> {
+        self.orders.values().cloned().collect()
     }
 
     /// The sum of every account's position in each coin on one venue, longs
@@ -533,6 +645,9 @@ impl Engine {
             .ok_or(EngineError::UnknownAccount(id))?;
         if matches!(entry.state, AccountState::Closed { .. }) {
             return Err(EngineError::AccountClosed(id));
+        }
+        if at.is_none() && self.orders.values().any(|open| open.account == id) {
+            return Err(EngineError::OrderPending(id));
         }
         self.schedule.table(market)?;
         let px = match at {
@@ -593,6 +708,7 @@ impl Engine {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn commit(
         &mut self,
         id: AccountId,
@@ -600,6 +716,7 @@ impl Engine {
         market: MarketId,
         side: Side,
         size: Decimal,
+        ids: Option<(u64, u64)>,
         now: u64,
     ) -> Result<Vec<Event>, EngineError> {
         let entry = self
@@ -616,6 +733,8 @@ impl Engine {
             px: priced.px,
             realized_pnl: priced.realized_pnl,
             fee: priced.fee,
+            order: ids.map(|(order, _)| order),
+            venue_order: ids.map(|(_, venue_order)| venue_order),
             at: now,
         }];
         reassess(
@@ -1505,6 +1624,8 @@ mod tests {
             px: dec!(60_000),
             realized_pnl: dec!(0),
             fee: dec!(0),
+            order: None,
+            venue_order: None,
             at: 7,
         };
         assert_eq!(
@@ -1700,5 +1821,127 @@ mod tests {
         let event: Event = serde_json::from_value(old.clone()).unwrap();
         assert!(matches!(event, Event::Filled { fee, .. } if fee.is_zero()));
         assert_eq!(serde_json::to_value(&event).unwrap(), old);
+    }
+
+    #[test]
+    fn an_order_is_noted_then_filled_at_the_venues_price() {
+        let mut engine = engine();
+        engine.set_mark(market("BTC"), Some(dec!(60_000)), 0);
+        let (id, _) = engine.create_account(dec!(3_000), 0).unwrap();
+
+        let (px, events) = engine
+            .send_order(id, market("BTC"), Side::Long, dec!(1), 77, 1)
+            .unwrap();
+        assert_eq!(px, dec!(60_000));
+        assert!(matches!(events[..], [Event::OrderSent { order: 77, .. }]));
+        assert!(engine.view(id).unwrap().positions.is_empty());
+        assert_eq!(engine.open_orders().len(), 1);
+        assert_eq!(engine.open_orders()[0].sent_at, 1);
+
+        // The venue filled half of it, above the mark.
+        let (account, events) = engine
+            .record_fill(77, dec!(0.5), dec!(60_100), 4_242, 2)
+            .unwrap();
+        assert_eq!(account, id);
+        assert!(matches!(
+            events[0],
+            Event::Filled {
+                size,
+                px,
+                order: Some(77),
+                venue_order: Some(4_242),
+                ..
+            } if size == dec!(0.5) && px == dec!(60_100)
+        ));
+        assert!(engine.open_orders().is_empty());
+        assert_eq!(
+            engine.record_fill(77, dec!(0.5), dec!(60_100), 4_242, 3),
+            Err(EngineError::UnknownOrder(77))
+        );
+    }
+
+    #[test]
+    fn an_order_the_account_cannot_carry_is_not_noted() {
+        let mut engine = engine();
+        engine.set_mark(market("BTC"), Some(dec!(60_000)), 0);
+        let (id, _) = engine.create_account(dec!(100), 0).unwrap();
+        assert_eq!(
+            engine.send_order(id, market("BTC"), Side::Long, dec!(1), 77, 1),
+            Err(EngineError::InsufficientMargin)
+        );
+        assert!(engine.open_orders().is_empty());
+    }
+
+    #[test]
+    fn an_unanswered_order_holds_the_account_until_it_is_settled() {
+        let mut engine = engine();
+        engine.set_mark(market("BTC"), Some(dec!(60_000)), 0);
+        let (id, _) = engine.create_account(dec!(3_000), 0).unwrap();
+        let (other, _) = engine.create_account(dec!(3_000), 0).unwrap();
+        engine
+            .send_order(id, market("BTC"), Side::Long, dec!(0.1), 77, 1)
+            .unwrap();
+
+        assert_eq!(
+            engine.fill(id, market("BTC"), Side::Long, dec!(0.1), 2),
+            Err(EngineError::OrderPending(id))
+        );
+        assert_eq!(
+            engine.send_order(id, market("BTC"), Side::Long, dec!(0.1), 78, 2),
+            Err(EngineError::OrderPending(id))
+        );
+        assert_eq!(
+            engine.send_order(other, market("BTC"), Side::Long, dec!(0.1), 77, 2),
+            Err(EngineError::DuplicateOrder(77))
+        );
+        // Another account is not held.
+        engine
+            .fill(other, market("BTC"), Side::Long, dec!(0.1), 2)
+            .unwrap();
+
+        let events = engine.drop_order(77, 3).unwrap();
+        assert_eq!(
+            events,
+            vec![Event::OrderDropped {
+                account: id,
+                order: 77,
+                at: 3,
+            }]
+        );
+        assert_eq!(engine.drop_order(77, 4), Err(EngineError::UnknownOrder(77)));
+        engine
+            .fill(id, market("BTC"), Side::Long, dec!(0.1), 4)
+            .unwrap();
+    }
+
+    #[test]
+    fn order_ids_are_in_the_json_only_for_fills_that_have_them() {
+        let mut engine = engine();
+        engine.set_mark(market("BTC"), Some(dec!(60_000)), 0);
+        let (id, _) = engine.create_account(dec!(3_000), 0).unwrap();
+        let paper = engine
+            .fill(id, market("BTC"), Side::Long, dec!(0.1), 1)
+            .unwrap();
+        let json = serde_json::to_value(&paper[0]).unwrap();
+        assert!(json.get("order").is_none() && json.get("venue_order").is_none());
+
+        let (_, sent) = engine
+            .send_order(id, market("BTC"), Side::Long, dec!(0.1), 77, 2)
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(&sent[0]).unwrap(),
+            serde_json::json!({
+                "type": "order_sent", "account": 1, "venue": "hyperliquid", "coin": "BTC",
+                "side": "long", "size": "0.1", "px": "60000", "order": 77, "at": 2
+            })
+        );
+        let (_, filled) = engine
+            .record_fill(77, dec!(0.1), dec!(60_000), 9, 3)
+            .unwrap();
+        let json = serde_json::to_value(&filled[0]).unwrap();
+        assert_eq!(json["order"], 77);
+        assert_eq!(json["venue_order"], 9);
+        let back: Event = serde_json::from_value(json).unwrap();
+        assert_eq!(back, filled[0]);
     }
 }

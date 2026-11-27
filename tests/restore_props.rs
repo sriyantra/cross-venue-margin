@@ -53,6 +53,14 @@ enum Op {
         side: Side,
         size: Decimal,
     },
+    /// An order sent to the first venue. `filled` is how many tenths of it
+    /// the venue fills, `None` when the answer never arrives.
+    Order {
+        account: usize,
+        side: Side,
+        size: Decimal,
+        filled: Option<u8>,
+    },
     /// `None` withdraws the mark.
     Mark(usize, Option<Decimal>),
     /// A funding settlement in one market, at this rate.
@@ -63,7 +71,15 @@ enum Op {
 /// called and liquidated by a move.
 fn op() -> impl Strategy<Value = Op> {
     let side = prop_oneof![Just(Side::Long), Just(Side::Short)];
+    let order_side = prop_oneof![Just(Side::Long), Just(Side::Short)];
     prop_oneof![
+        2 => (0usize..4, order_side, 1i64..=300_000, proptest::option::weighted(0.9, 0u8..=10))
+            .prop_map(|(account, side, units, filled)| Op::Order {
+                account,
+                side,
+                size: Decimal::new(units, 4),
+                filled,
+            }),
         1 => (0i64..=200_000).prop_map(|cents| Op::Open(Decimal::new(cents, 2))),
         1 => (0usize..4, any::<bool>(), 0i64..=100_000).prop_map(|(account, coin, units)| {
             Op::Deposit { account, coin, amount: Decimal::new(units, 4) }
@@ -140,6 +156,33 @@ fn run(ops: &[Op]) -> Run {
                     run.events.extend(events);
                 }
             }
+            Op::Order {
+                account,
+                side,
+                size,
+                filled,
+            } => {
+                let Some(id) = run.accounts.get(*account) else {
+                    continue;
+                };
+                let [market, _] = markets();
+                let Ok((px, events)) = run.engine.send_order(*id, market, *side, *size, now, now)
+                else {
+                    continue;
+                };
+                run.events.extend(events);
+                match filled {
+                    None => {}
+                    Some(0) => run.events.extend(run.engine.drop_order(now, now).unwrap()),
+                    Some(tenths) => {
+                        let part = *size * Decimal::new(i64::from(*tenths), 1);
+                        let px = px + dec!(0.07);
+                        let (_, events) =
+                            run.engine.record_fill(now, part, px, now + 9, now).unwrap();
+                        run.events.extend(events);
+                    }
+                }
+            }
             Op::Funding(market, rate) => {
                 run.engine.set_funding(
                     markets()[*market].clone(),
@@ -185,6 +228,7 @@ proptest! {
         for id in &run.accounts {
             prop_assert_eq!(restored.view(*id), run.engine.view(*id));
         }
+        prop_assert_eq!(restored.open_orders(), run.engine.open_orders());
 
         // New accounts continue the numbering.
         let mut original = run.engine;

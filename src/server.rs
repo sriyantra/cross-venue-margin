@@ -35,7 +35,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
 
 use crate::engine::task::EngineHandle;
-use crate::engine::{AccountId, AccountView, EngineError};
+use crate::engine::{AccountId, AccountView, EngineError, OpenOrder};
 use crate::execution::{ExecutionError, Executor};
 use crate::feed::{BookRx, BookView, Feeds, MarkView, Slot};
 use crate::metrics::{self, Metrics};
@@ -290,6 +290,9 @@ fn engine_error(error: EngineError) -> Response {
     let status = match &error {
         EngineError::UnknownAccount(_) => StatusCode::NOT_FOUND,
         EngineError::AccountClosed(_)
+        | EngineError::OrderPending(_)
+        | EngineError::DuplicateOrder(_)
+        | EngineError::UnknownOrder(_)
         | EngineError::InsufficientMargin
         | EngineError::InsufficientLiquidity { .. } => StatusCode::CONFLICT,
         EngineError::NoMark(_) | EngineError::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
@@ -376,8 +379,10 @@ impl IntoResponse for FillError {
 /// Sends an order to the venue and records what it filled.
 ///
 /// The engine is asked first whether it would accept the fill, so an order
-/// the account cannot carry never reaches the venue. Once the venue has
-/// filled, the fill is recorded whatever the account looks like by then.
+/// the account cannot carry never reaches the venue. It notes the order as
+/// sent. Once the venue has filled, the fill is recorded whatever the
+/// account looks like by then. If the venue refuses, the order is dropped.
+/// If no answer comes, the order stays open for `execution::repair`.
 async fn execute(
     engine: &EngineHandle,
     executor: &Executor,
@@ -387,18 +392,26 @@ async fn execute(
     size: Decimal,
 ) -> Result<AccountView, FillError> {
     let _turn = executor.turn().await;
+    let order = executor.next_order();
     let reference = engine
-        .check_fill(account, market.clone(), side, size)
+        .send_order(account, market.clone(), side, size, order)
         .await
         .map_err(FillError::Engine)?;
-    let done = executor
-        .market_order(&market.coin, side, size, reference)
+    match executor
+        .market_order(&market.coin, side, size, reference, order)
         .await
-        .map_err(FillError::Venue)?;
-    engine
-        .record_fill(account, market, side, done.size, done.px)
-        .await
-        .map_err(FillError::Engine)
+    {
+        Ok(done) => engine
+            .record_fill(order, done.size, done.px, done.order_id)
+            .await
+            .map_err(FillError::Engine),
+        Err(error) => {
+            if !error.outcome_unknown() {
+                engine.drop_order(order).await.map_err(FillError::Engine)?;
+            }
+            Err(FillError::Venue(error))
+        }
+    }
 }
 
 async fn fill(
@@ -448,6 +461,8 @@ struct Reconciliation {
     /// True when the wallet holds exactly what the accounts add up to.
     matched: bool,
     coins: Vec<CoinReconciliation>,
+    /// Orders sent to the venue that have no answer yet.
+    open_orders: Vec<OpenOrder>,
 }
 
 /// Compares the positions the engine has recorded on Hyperliquid with the
@@ -464,6 +479,10 @@ async fn reconciliation(
     };
     let recorded = match engine.net_positions(Venue::Hyperliquid).await {
         Ok(recorded) => recorded,
+        Err(error) => return engine_error(error),
+    };
+    let open_orders = match engine.open_orders().await {
+        Ok(open_orders) => open_orders,
         Err(error) => return engine_error(error),
     };
     let held = match executor.account().await {
@@ -490,6 +509,7 @@ async fn reconciliation(
         account_value: held.account_value,
         matched: coins.iter().all(|coin| coin.difference.is_zero()),
         coins,
+        open_orders,
     })
     .into_response()
 }

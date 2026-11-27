@@ -13,7 +13,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 
-use super::{AccountId, AccountView, Engine, EngineError, Event, Funding};
+use super::{AccountId, AccountView, Engine, EngineError, Event, Funding, OpenOrder};
 use crate::feed::{BookRx, FundingRx, MarkRx};
 use crate::metrics::Metrics;
 use crate::risk::{MarketId, Side, Venue};
@@ -39,23 +39,31 @@ pub enum Command {
         size: Decimal,
         reply: Reply<Result<AccountView, EngineError>>,
     },
-    /// Asks whether a fill would be accepted, and at what price, without
-    /// applying it.
-    CheckFill {
+    /// Notes an order that is about to go to a venue, if the account can
+    /// carry it, and replies with the price it is expected to fill at.
+    SendOrder {
         account: AccountId,
         market: MarketId,
         side: Side,
         size: Decimal,
+        order: u64,
         reply: Reply<Result<Decimal, EngineError>>,
     },
-    /// Records a fill a venue has already made.
+    /// Records what a venue filled of an order.
     RecordFill {
-        account: AccountId,
-        market: MarketId,
-        side: Side,
+        order: u64,
         size: Decimal,
         px: Decimal,
+        venue_order: u64,
         reply: Reply<Result<AccountView, EngineError>>,
+    },
+    /// Forgets an order the venue filled none of.
+    DropOrder {
+        order: u64,
+        reply: Reply<Result<(), EngineError>>,
+    },
+    OpenOrders {
+        reply: Reply<Vec<OpenOrder>>,
     },
     Get {
         account: AccountId,
@@ -127,18 +135,20 @@ impl EngineHandle {
         .await?
     }
 
-    pub async fn check_fill(
+    pub async fn send_order(
         &self,
         account: AccountId,
         market: MarketId,
         side: Side,
         size: Decimal,
+        order: u64,
     ) -> Result<Decimal, EngineError> {
-        self.request(|reply| Command::CheckFill {
+        self.request(|reply| Command::SendOrder {
             account,
             market,
             side,
             size,
+            order,
             reply,
         })
         .await?
@@ -146,21 +156,28 @@ impl EngineHandle {
 
     pub async fn record_fill(
         &self,
-        account: AccountId,
-        market: MarketId,
-        side: Side,
+        order: u64,
         size: Decimal,
         px: Decimal,
+        venue_order: u64,
     ) -> Result<AccountView, EngineError> {
         self.request(|reply| Command::RecordFill {
-            account,
-            market,
-            side,
+            order,
             size,
             px,
+            venue_order,
             reply,
         })
         .await?
+    }
+
+    pub async fn drop_order(&self, order: u64) -> Result<(), EngineError> {
+        self.request(|reply| Command::DropOrder { order, reply })
+            .await?
+    }
+
+    pub async fn open_orders(&self) -> Result<Vec<OpenOrder>, EngineError> {
+        self.request(|reply| Command::OpenOrders { reply }).await
     }
 
     pub async fn get(&self, account: AccountId) -> Result<Option<AccountView>, EngineError> {
@@ -371,26 +388,31 @@ fn handle(engine: &mut Engine, command: Command, now: u64) -> Vec<Event> {
             let _ = reply.send(result);
             events
         }
-        Command::CheckFill {
+        Command::SendOrder {
             account,
             market,
             side,
             size,
+            order,
             reply,
         } => {
-            let _ = reply.send(engine.check_fill(account, &market, side, size));
-            Vec::new()
+            let (result, events) = match engine.send_order(account, market, side, size, order, now)
+            {
+                Ok((px, events)) => (Ok(px), events),
+                Err(error) => (Err(error), Vec::new()),
+            };
+            let _ = reply.send(result);
+            events
         }
         Command::RecordFill {
-            account,
-            market,
-            side,
+            order,
             size,
             px,
+            venue_order,
             reply,
         } => {
-            let (result, events) = match engine.record_fill(account, market, side, size, px, now) {
-                Ok(events) => (
+            let (result, events) = match engine.record_fill(order, size, px, venue_order, now) {
+                Ok((account, events)) => (
                     engine
                         .view(account)
                         .ok_or(EngineError::UnknownAccount(account)),
@@ -400,6 +422,18 @@ fn handle(engine: &mut Engine, command: Command, now: u64) -> Vec<Event> {
             };
             let _ = reply.send(result);
             events
+        }
+        Command::DropOrder { order, reply } => {
+            let (result, events) = match engine.drop_order(order, now) {
+                Ok(events) => (Ok(()), events),
+                Err(error) => (Err(error), Vec::new()),
+            };
+            let _ = reply.send(result);
+            events
+        }
+        Command::OpenOrders { reply } => {
+            let _ = reply.send(engine.open_orders());
+            Vec::new()
         }
         Command::Get { account, reply } => {
             let _ = reply.send(engine.view(account));

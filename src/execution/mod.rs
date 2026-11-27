@@ -6,6 +6,10 @@
 //! orders go through one wallet, so the wallet's position in a coin is the
 //! sum of the accounts' positions in it.
 //!
+//! Every order carries an id the engine logged before it was sent. When an
+//! answer does not arrive, `repair` asks the venue what became of that id
+//! and records the fill or drops the order.
+//!
 //! `sign` is pure. The price and reply handling in this module is pure too.
 //! `Executor` is the I/O: it owns the HTTP client and the wallet.
 
@@ -20,10 +24,12 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use thiserror::Error;
 use tokio::sync::{Mutex, MutexGuard, mpsc};
+use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use self::sign::{OrderAction, SignError, Wallet};
-use crate::engine::Event;
+use crate::engine::task::EngineHandle;
+use crate::engine::{EngineError, Event};
 use crate::risk::{Side, Venue};
 
 /// The only HTTP endpoint orders are ever sent to.
@@ -43,6 +49,14 @@ const PRICE_FIGURES: u32 = 5;
 /// A price may have this many decimals, less the decimals of the size.
 const PRICE_DECIMALS: u32 = 6;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+/// How often unanswered orders are asked after.
+const REPAIR_EVERY: Duration = Duration::from_secs(15);
+/// An order the venue still does not know this long after it was sent is
+/// taken as never having arrived.
+const GIVE_UP_AFTER_MS: u64 = 60_000;
+/// Fills are searched for from this long before the order was sent, to
+/// allow for a difference between this clock and the venue's.
+const CLOCK_SLACK_MS: u64 = 60_000;
 
 #[derive(Debug, Error)]
 pub enum ExecutionError {
@@ -56,7 +70,7 @@ pub enum ExecutionError {
     InvalidPrice(Decimal),
     /// The request did not complete. The order may or may not have reached
     /// the venue, so the wallet may hold a position the engine does not
-    /// know about. Reconciliation shows it.
+    /// know about yet. The order stays open until `repair` settles it.
     #[error("the venue could not be reached: {0}")]
     Transport(String),
     #[error("the venue refused the order: {0}")]
@@ -65,6 +79,13 @@ pub enum ExecutionError {
     NotFilled,
     #[error("the venue's reply was not understood: {0}")]
     Reply(String),
+}
+
+impl ExecutionError {
+    /// True when the order may have filled all the same.
+    pub fn outcome_unknown(&self) -> bool {
+        matches!(self, Self::Transport(_) | Self::Reply(_))
+    }
 }
 
 /// What the venue did with an order.
@@ -147,6 +168,69 @@ fn parse_order_reply(reply: &Value) -> Result<Execution, ExecutionError> {
         px: filled.avg_px,
         order_id: filled.oid,
     })
+}
+
+/// What became of an order whose answer did not arrive.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Outcome {
+    Filled(Execution),
+    /// The venue filled none of it and never will.
+    Unfilled,
+    /// Not known yet. Ask again later.
+    Unknown,
+}
+
+/// What the venue says about an order looked up by id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum OrderStatus {
+    /// The venue has no order with that id.
+    NotFound,
+    /// The order is still working.
+    Open,
+    /// The order is finished. `filled` is true when all of `size` traded.
+    Done {
+        order_id: u64,
+        size: Decimal,
+        filled: bool,
+    },
+}
+
+fn parse_order_status(reply: &Value) -> Option<OrderStatus> {
+    match reply["status"].as_str()? {
+        "unknownOid" => Some(OrderStatus::NotFound),
+        "order" => {
+            let order = &reply["order"]["order"];
+            match reply["order"]["status"].as_str()? {
+                "open" => Some(OrderStatus::Open),
+                status => Some(OrderStatus::Done {
+                    order_id: order["oid"].as_u64()?,
+                    size: order["origSz"].as_str()?.parse().ok()?,
+                    filled: status == "filled",
+                }),
+            }
+        }
+        _ => None,
+    }
+}
+
+/// The size and average price of one order's fills among a wallet's
+/// fills. `None` if the reply is not a list of fills.
+fn sum_fills(reply: &Value, order_id: u64) -> Option<(Decimal, Decimal)> {
+    let mut size = Decimal::ZERO;
+    let mut notional = Decimal::ZERO;
+    for fill in reply.as_array()? {
+        if fill["oid"].as_u64()? != order_id {
+            continue;
+        }
+        let px: Decimal = fill["px"].as_str()?.parse().ok()?;
+        let sz: Decimal = fill["sz"].as_str()?.parse().ok()?;
+        size = size.checked_add(sz)?;
+        notional = notional.checked_add(px.checked_mul(sz)?)?;
+    }
+    if size.is_zero() {
+        return Some((size, Decimal::ZERO));
+    }
+    Some((size.normalize(), notional.checked_div(size)?.normalize()))
 }
 
 fn parse_account(reply: &Value) -> Option<VenueAccount> {
@@ -265,14 +349,25 @@ impl Executor {
             .map_err(transport)?;
         let status = response.status();
         let text = response.text().await.map_err(transport)?;
+        // A failure on the way says nothing about what the venue did.
+        if status.is_server_error() {
+            return Err(ExecutionError::Transport(format!("{status}: {text}")));
+        }
         if !status.is_success() {
             return Err(ExecutionError::Rejected(format!("{status}: {text}")));
         }
         serde_json::from_str(&text).map_err(|_| ExecutionError::Reply(text))
     }
 
+    /// An id for the next order. It is also the order's nonce, so it is
+    /// new for every order this wallet sends.
+    pub fn next_order(&self) -> u64 {
+        self.nonce()
+    }
+
     /// Buys or sells `size` of `coin` at once, at no worse than `slippage`
-    /// past `reference`. Whatever does not fill is cancelled.
+    /// past `reference`. Whatever does not fill is cancelled. `order` comes
+    /// from `next_order`.
     async fn order(
         &self,
         coin: &str,
@@ -280,6 +375,7 @@ impl Executor {
         size: Decimal,
         reference: Decimal,
         slippage: Decimal,
+        order: u64,
     ) -> Result<Execution, ExecutionError> {
         let asset = self
             .assets
@@ -298,8 +394,9 @@ impl Executor {
             side == Side::Long,
             px.to_string(),
             size.normalize().to_string(),
+            order,
         );
-        let nonce = self.nonce();
+        let nonce = order;
         let signature = self.wallet.sign(&action, nonce)?;
         let body = json!({
             "action": action,
@@ -315,6 +412,7 @@ impl Executor {
             limit = %px,
             filled = %execution.size,
             px = %execution.px,
+            order,
             order_id = execution.order_id,
             "order filled on testnet"
         );
@@ -322,15 +420,60 @@ impl Executor {
     }
 
     /// Sends an account's order to the venue. `reference` is the price the
-    /// engine expects it to fill at.
+    /// engine expects it to fill at, and `order` comes from `next_order`.
     pub async fn market_order(
         &self,
         coin: &str,
         side: Side,
         size: Decimal,
         reference: Decimal,
+        order: u64,
     ) -> Result<Execution, ExecutionError> {
-        self.order(coin, side, size, reference, SLIPPAGE).await
+        self.order(coin, side, size, reference, SLIPPAGE, order)
+            .await
+    }
+
+    /// Asks the venue what became of an order sent at `sent_at`.
+    pub async fn outcome(&self, order: u64, sent_at: u64) -> Result<Outcome, ExecutionError> {
+        let body = json!({
+            "type": "orderStatus",
+            "user": self.address(),
+            "oid": sign::client_id(order),
+        });
+        let reply = self.post("/info", &body).await?;
+        let status =
+            parse_order_status(&reply).ok_or_else(|| ExecutionError::Reply(reply.to_string()))?;
+        let (order_id, size, filled) = match status {
+            OrderStatus::NotFound if now_ms() > sent_at.saturating_add(GIVE_UP_AFTER_MS) => {
+                return Ok(Outcome::Unfilled);
+            }
+            OrderStatus::NotFound | OrderStatus::Open => return Ok(Outcome::Unknown),
+            OrderStatus::Done {
+                order_id,
+                size,
+                filled,
+            } => (order_id, size, filled),
+        };
+        let body = json!({
+            "type": "userFillsByTime",
+            "user": self.address(),
+            "startTime": sent_at.saturating_sub(CLOCK_SLACK_MS),
+        });
+        let reply = self.post("/info", &body).await?;
+        let (traded, px) =
+            sum_fills(&reply, order_id).ok_or_else(|| ExecutionError::Reply(reply.to_string()))?;
+        Ok(if filled && traded != size {
+            // The order is filled and its fills are not all listed yet.
+            Outcome::Unknown
+        } else if traded.is_zero() {
+            Outcome::Unfilled
+        } else {
+            Outcome::Filled(Execution {
+                size: traded,
+                px,
+                order_id,
+            })
+        })
     }
 
     /// The wallet's account value and positions on the venue.
@@ -396,6 +539,7 @@ pub async fn run_closes(
                 close.size,
                 close.px,
                 LIQUIDATION_SLIPPAGE,
+                executor.next_order(),
             )
             .await
         {
@@ -411,9 +555,121 @@ pub async fn run_closes(
     }
 }
 
+/// Settles every order the engine sent and has no answer for: a fill the
+/// venue made is recorded on the account that asked for it, and an order
+/// the venue did not fill is dropped.
+pub async fn repair(engine: &EngineHandle, executor: &Executor) {
+    // No order is in flight while this holds the turn.
+    let _turn = executor.turn().await;
+    let Ok(orders) = engine.open_orders().await else {
+        return;
+    };
+    for open in orders {
+        let order = open.order;
+        let done = match executor.outcome(order, open.sent_at).await {
+            Ok(Outcome::Filled(done)) => done,
+            Ok(Outcome::Unfilled) => {
+                if engine.drop_order(order).await.is_ok() {
+                    info!(order, account = %open.account, "order was not filled, dropped");
+                }
+                continue;
+            }
+            Ok(Outcome::Unknown) => continue,
+            Err(error) => {
+                warn!(order, %error, "order could not be looked up");
+                continue;
+            }
+        };
+        match engine
+            .record_fill(order, done.size, done.px, done.order_id)
+            .await
+        {
+            Ok(_) => info!(
+                order,
+                account = %open.account,
+                market = %open.market,
+                size = %done.size,
+                px = %done.px,
+                "recorded a fill whose answer was lost"
+            ),
+            // The account was liquidated while the order was out. The fill
+            // has no account to go to, and reconciliation shows it.
+            Err(EngineError::AccountClosed(account)) => {
+                warn!(order, %account, size = %done.size, "fill belongs to a closed account");
+                let _ = engine.drop_order(order).await;
+            }
+            Err(error) => warn!(order, %error, "fill could not be recorded"),
+        }
+    }
+}
+
+/// Runs `repair` at startup and then on a timer, until `shutdown`.
+pub async fn run_repairs(
+    engine: EngineHandle,
+    executor: std::sync::Arc<Executor>,
+    shutdown: CancellationToken,
+) {
+    let mut every = tokio::time::interval(REPAIR_EVERY);
+    every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            _ = shutdown.cancelled() => break,
+            _ = every.tick() => repair(&engine, &executor).await,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_order_looked_up_is_found_finished_or_missing() {
+        let filled = json!({"status": "order", "order": {
+            "order": {"coin": "BTC", "sz": "0.0", "oid": 77, "origSz": "0.0002", "cloid": null},
+            "status": "filled", "statusTimestamp": 1
+        }});
+        assert_eq!(
+            parse_order_status(&filled),
+            Some(OrderStatus::Done {
+                order_id: 77,
+                size: dec!(0.0002),
+                filled: true,
+            })
+        );
+        let cancelled = json!({"status": "order", "order": {
+            "order": {"oid": 78, "origSz": "0.5"}, "status": "canceled"
+        }});
+        assert_eq!(
+            parse_order_status(&cancelled),
+            Some(OrderStatus::Done {
+                order_id: 78,
+                size: dec!(0.5),
+                filled: false,
+            })
+        );
+        let open = json!({"status": "order", "order": {
+            "order": {"oid": 79, "origSz": "0.5"}, "status": "open"
+        }});
+        assert_eq!(parse_order_status(&open), Some(OrderStatus::Open));
+        assert_eq!(
+            parse_order_status(&json!({"status": "unknownOid"})),
+            Some(OrderStatus::NotFound)
+        );
+        assert_eq!(parse_order_status(&json!({"status": "other"})), None);
+    }
+
+    #[test]
+    fn fills_of_one_order_are_added_up_at_their_average_price() {
+        let fills = json!([
+            {"oid": 77, "px": "60000.0", "sz": "0.1"},
+            {"oid": 12, "px": "1.0", "sz": "5"},
+            {"oid": 77, "px": "60100.0", "sz": "0.3"}
+        ]);
+        assert_eq!(sum_fills(&fills, 77), Some((dec!(0.4), dec!(60075))));
+        assert_eq!(sum_fills(&fills, 99), Some((dec!(0), dec!(0))));
+        assert_eq!(sum_fills(&json!({"error": "x"}), 77), None);
+    }
 
     #[test]
     fn limit_price_reaches_through_the_book_and_fits_the_venue() {

@@ -12,7 +12,7 @@
 use rust_decimal::Decimal;
 use thiserror::Error;
 
-use super::{AccountId, Engine, Entry, Event};
+use super::{AccountId, Engine, Entry, Event, OpenOrder};
 use crate::risk::{
     Account, AccountState, MarketId, Position, PositionError, RiskError, Schedule, Thresholds,
 };
@@ -44,6 +44,10 @@ pub enum Reason {
     Deposit(Decimal),
     #[error("liquidation of {0} does not match the position held")]
     Liquidation(MarketId),
+    #[error("order {0} was sent twice")]
+    DuplicateOrder(u64),
+    #[error("order {0} is answered, but the log has no such order waiting")]
+    UnknownOrder(u64),
     #[error(transparent)]
     Position(#[from] PositionError),
     #[error(transparent)]
@@ -108,8 +112,18 @@ impl Engine {
                 px,
                 realized_pnl,
                 fee,
+                order,
                 ..
             } => {
+                if let Some(order) = order {
+                    let sent = self.orders.get(order).is_some_and(|open| {
+                        open.account == *account && open.market == *market && open.side == *side
+                    });
+                    if !sent {
+                        return Err(Reason::UnknownOrder(*order));
+                    }
+                    self.orders.remove(order);
+                }
                 let entry = self.open_entry(*account)?;
                 let fill = Position::new(*side, *size, *px)?;
                 let replayed = entry.account.apply_fill(market.clone(), fill)?;
@@ -124,6 +138,42 @@ impl Engine {
                     .collateral
                     .checked_sub(*fee)
                     .ok_or(RiskError::Overflow)?;
+            }
+            Event::OrderSent {
+                account,
+                market,
+                side,
+                size,
+                px,
+                order,
+                at,
+            } => {
+                self.open_entry(*account)?;
+                if self.orders.contains_key(order) {
+                    return Err(Reason::DuplicateOrder(*order));
+                }
+                self.orders.insert(
+                    *order,
+                    OpenOrder {
+                        order: *order,
+                        account: *account,
+                        market: market.clone(),
+                        side: *side,
+                        size: *size,
+                        px: *px,
+                        sent_at: *at,
+                    },
+                );
+            }
+            Event::OrderDropped { account, order, .. } => {
+                let sent = self
+                    .orders
+                    .get(order)
+                    .is_some_and(|open| open.account == *account);
+                if !sent {
+                    return Err(Reason::UnknownOrder(*order));
+                }
+                self.orders.remove(order);
             }
             Event::StateChanged {
                 account, from, to, ..
@@ -413,5 +463,52 @@ mod tests {
             engine.view(id)
         });
         assert_eq!(restored.view(id).unwrap().collateral, dec!(-58.5));
+    }
+
+    #[test]
+    fn orders_are_restored_with_their_answers() {
+        let (schedule, thresholds) = parts();
+        let mut engine = Engine::new(schedule, thresholds);
+        engine.set_mark(btc(), Some(dec!(60_000)), 0);
+        let (id, mut events) = engine.create_account(dec!(9_000), 1).unwrap();
+        let (other, opened) = engine.create_account(dec!(9_000), 1).unwrap();
+        events.extend(opened);
+        let send = |engine: &mut Engine, account, order, at| {
+            engine
+                .send_order(account, btc(), Side::Long, dec!(0.1), order, at)
+                .unwrap()
+                .1
+        };
+        // One order filled, one dropped, one never answered.
+        events.extend(send(&mut engine, id, 10, 2));
+        events.extend(
+            engine
+                .record_fill(10, dec!(0.1), dec!(60_050), 500, 3)
+                .unwrap()
+                .1,
+        );
+        events.extend(send(&mut engine, id, 11, 4));
+        events.extend(engine.drop_order(11, 5).unwrap());
+        events.extend(send(&mut engine, other, 12, 6));
+
+        let mut restored = restore(&events).unwrap();
+        assert!(restored.set_mark(btc(), Some(dec!(60_000)), 7).is_empty());
+        assert_eq!(restored.view(id), engine.view(id));
+        assert_eq!(restored.open_orders(), engine.open_orders());
+        assert_eq!(restored.open_orders().len(), 1);
+        assert_eq!(restored.open_orders()[0].order, 12);
+        assert_eq!(restored.open_orders()[0].sent_at, 6);
+
+        // An answer to an order the log never sent is not a possible log.
+        let unsent: Vec<Event> = events
+            .iter()
+            .filter(|event| !matches!(event, Event::OrderSent { order: 10, .. }))
+            .cloned()
+            .collect();
+        let reason = |events: &[Event]| restore(events).err().map(|e| e.reason);
+        assert_eq!(reason(&unsent), Some(Reason::UnknownOrder(10)));
+        let mut twice = events.clone();
+        twice.push(events.last().unwrap().clone());
+        assert_eq!(reason(&twice), Some(Reason::DuplicateOrder(12)));
     }
 }

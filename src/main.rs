@@ -209,10 +209,20 @@ async fn main() -> Result<()> {
         )),
         None => tokio::spawn(log_events(event_rx)),
     };
+    let engine = EngineHandle::new(command_tx);
+    // Orders the log says were sent and never answered are settled with
+    // the venue, now and whenever one is left behind later.
+    let repairs = executor.clone().map(|executor| {
+        tokio::spawn(execution::run_repairs(
+            engine.clone(),
+            executor,
+            shutdown.clone(),
+        ))
+    });
     let api = tokio::spawn(server::serve(
         config.bind,
         feeds,
-        EngineHandle::new(command_tx),
+        engine,
         metrics,
         config.read_only,
         executor,
@@ -229,6 +239,9 @@ async fn main() -> Result<()> {
     if let Some((forward, closes)) = venue_tasks {
         forward.await?;
         closes.await?;
+    }
+    if let Some(repairs) = repairs {
+        repairs.await?;
     }
     event_log.await?;
     api.await??;

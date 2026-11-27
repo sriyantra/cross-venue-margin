@@ -123,24 +123,31 @@ HL_TESTNET_KEY=0x... cargo run --release
 With a key, a fill on a Hyperliquid market becomes a real order:
 
 1. The engine checks the order against the account, the margin rules and
-   the testnet book. Nothing changes yet.
+   the testnet book, and logs it under a new id. No position changes yet.
 2. The service signs an immediate-or-cancel limit order, 5% through the
-   expected price, and sends it.
+   expected price, and sends it with that id.
 3. The engine records the size and average price the venue reports.
+
+If the answer is lost, the order stays open and its account takes no other
+fill. A repair task asks the venue about every open order by its id, at
+startup and every 15 seconds. A fill is recorded on the account that sent
+the order, and an order that did not fill is dropped.
 
 The engine task never waits on the venue: the API handler makes the call
 between the two engine commands. All accounts trade through one wallet, and
 `GET /venues/hyperliquid/reconciliation` compares the sum of their
-positions with what the wallet holds. A position the engine liquidates is
+positions with what the wallet holds and lists the open orders. A position the engine liquidates is
 closed on the venue by a separate task.
 
 Signing (MessagePack action hash, EIP-712, secp256k1) is tested against the
 venue's reference client: same key, order and nonce, same signature. The
 signature is bound to testnet.
 
-Limits: OKX fills stay on paper. A request that times out can leave a fill
-the engine did not record, which reconciliation reports and nothing
-repairs. Accounts pay the venue's base taker rate, not the fee the venue
+Limits: OKX fills stay on paper. A liquidation close whose answer is lost
+is reported by reconciliation and not repaired. An order the venue does
+not know 60 seconds after it was sent is taken as never sent. An order is
+logged before it is sent, but the engine does not wait for that write to
+reach Postgres. Accounts pay the venue's base taker rate, not the fee the venue
 reports for each fill. Hyperliquid prices come from testnet in this mode,
 and testnet is not mainnet.
 
@@ -170,7 +177,7 @@ and testnet is not mainnet.
 | `GET /accounts/{id}` | State, health, collateral and positions with liquidation prices |
 | `POST /accounts/{id}/deposits` | Add collateral. `{"asset":"BTC","amount":"0.5"}` |
 | `POST /accounts/{id}/fills` | Fill an order. `{"venue":"okx","coin":"BTC","side":"short","size":"0.5"}` |
-| `GET /venues/hyperliquid/reconciliation` | Engine positions against the testnet wallet |
+| `GET /venues/hyperliquid/reconciliation` | Engine positions against the testnet wallet, and orders with no answer yet |
 | `GET /metrics` | Prometheus metrics |
 
 `/metrics` includes `feed_to_decision_seconds`, a histogram from a mark
@@ -194,7 +201,7 @@ TEST_DATABASE_URL=postgres://postgres@127.0.0.1:5432/postgres cargo test
 - The connectors run against local fake venues: desync recovery, sequence
   gaps, reconnects.
 - Execution runs the API against a stand-in venue: the order sent,
-  partial fills, refusals from either side, reconciliation.
+  partial fills, refusals from either side, lost answers, reconciliation.
 - The event store runs against a real Postgres when `TEST_DATABASE_URL` is
   set: restore after restart, all-or-nothing appends, rejected updates and
   deletes.
