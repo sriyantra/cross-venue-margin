@@ -7,7 +7,7 @@
 //! is what makes a recorded run replayable. `restore` rebuilds an engine
 //! from the events an earlier one emitted. `task` wraps it in a Tokio task.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::sync::Arc;
 
@@ -323,6 +323,11 @@ pub struct Engine {
     /// The next funding settlement of each market that has one coming.
     fundings: BTreeMap<MarketId, Funding>,
     accounts: BTreeMap<AccountId, Entry>,
+    /// For each market, the accounts its mark can change: those with a
+    /// position in it or collateral priced by it. An account is added when
+    /// it gains either, so the set never misses one. It can still list an
+    /// account that has since lost both, which the next mark removes.
+    exposed: BTreeMap<MarketId, BTreeSet<AccountId>>,
     /// Orders sent to a venue and not yet answered, by order id.
     orders: BTreeMap<u64, OpenOrder>,
     next_id: u64,
@@ -337,6 +342,7 @@ impl Engine {
             depths: Depths::new(),
             fundings: BTreeMap::new(),
             accounts: BTreeMap::new(),
+            exposed: BTreeMap::new(),
             orders: BTreeMap::new(),
             next_id: 1,
         }
@@ -387,10 +393,14 @@ impl Engine {
         if amount <= Decimal::ZERO {
             return Err(EngineError::NonPositiveDeposit(amount));
         }
-        if asset != CASH_ASSET {
-            self.schedule.collateral(asset)?;
-        }
+        let priced_by = match asset {
+            CASH_ASSET => None,
+            asset => Some(self.schedule.collateral(asset)?.price().clone()),
+        };
         entry.account.deposit(asset, amount)?;
+        if let Some(market) = priced_by {
+            self.exposed.entry(market).or_default().insert(id);
+        }
 
         let mut events = vec![Event::CollateralDeposited {
             account: id,
@@ -453,7 +463,11 @@ impl Engine {
             let Some(&mark) = self.marks.get(&market) else {
                 continue;
             };
-            for (&id, entry) in self.accounts.iter_mut() {
+            let holders = self.exposed.get(&market).into_iter().flatten();
+            for &id in holders {
+                let Some(entry) = self.accounts.get_mut(&id) else {
+                    continue;
+                };
                 let Some(position) = entry.account.position(&market) else {
                     continue;
                 };
@@ -724,6 +738,7 @@ impl Engine {
             .get_mut(&id)
             .ok_or(EngineError::UnknownAccount(id))?;
         entry.account = priced.account;
+        self.exposed.entry(market.clone()).or_default().insert(id);
 
         let mut events = vec![Event::Filled {
             account: id,
@@ -759,26 +774,50 @@ impl Engine {
             None => self.marks.remove(&market),
         };
 
+        let schedule = &self.schedule;
+        let exposed_to = |account: &Account| {
+            account.position(&market).is_some()
+                || account.assets().any(|(asset, _)| {
+                    schedule
+                        .collateral(asset)
+                        .is_ok_and(|rule| rule.price() == &market)
+                })
+        };
+        debug_assert!(
+            self.accounts.iter().all(|(id, entry)| {
+                !exposed_to(&entry.account)
+                    || self
+                        .exposed
+                        .get(&market)
+                        .is_some_and(|ids| ids.contains(id))
+            }),
+            "an account exposed to {market} is missing from the index"
+        );
+
         let mut events = Vec::new();
-        for (id, entry) in &mut self.accounts {
-            let priced_here = entry.account.assets().any(|(asset, _)| {
-                self.schedule
-                    .collateral(asset)
-                    .is_ok_and(|rule| rule.price() == &market)
-            });
-            if priced_here || entry.account.position(&market).is_some() {
-                reassess(
-                    *id,
-                    entry,
-                    &self.marks,
-                    &self.depths,
-                    &self.schedule,
-                    &self.thresholds,
-                    now,
-                    &mut events,
-                );
+        let Some(exposed) = self.exposed.get_mut(&market) else {
+            return events;
+        };
+        // In id order, the order a scan of every account would give.
+        exposed.retain(|id| {
+            let Some(entry) = self.accounts.get_mut(id) else {
+                return false;
+            };
+            if !exposed_to(&entry.account) {
+                return false;
             }
-        }
+            reassess(
+                *id,
+                entry,
+                &self.marks,
+                &self.depths,
+                schedule,
+                &self.thresholds,
+                now,
+                &mut events,
+            );
+            true
+        });
         events
     }
 
@@ -1943,5 +1982,36 @@ mod tests {
         assert_eq!(json["venue_order"], 9);
         let back: Event = serde_json::from_value(json).unwrap();
         assert_eq!(back, filled[0]);
+    }
+
+    #[test]
+    fn a_mark_reaches_an_account_again_after_it_left_the_market() {
+        let mut engine = engine();
+        engine.set_mark(market("BTC"), Some(dec!(60_000)), 0);
+        let (id, _) = engine.create_account(dec!(3_000), 0).unwrap();
+        engine
+            .fill(id, market("BTC"), Side::Long, dec!(1), 1)
+            .unwrap();
+        // Flat again: the next mark has nothing to recheck.
+        engine
+            .fill(id, market("BTC"), Side::Short, dec!(1), 2)
+            .unwrap();
+        assert!(
+            engine
+                .set_mark(market("BTC"), Some(dec!(50_000)), 3)
+                .is_empty()
+        );
+        assert!(
+            engine
+                .set_mark(market("BTC"), Some(dec!(60_000)), 4)
+                .is_empty()
+        );
+
+        // Back in the market, a falling mark liquidates it as before.
+        engine
+            .fill(id, market("BTC"), Side::Long, dec!(1), 5)
+            .unwrap();
+        let events = engine.set_mark(market("BTC"), Some(dec!(57_000)), 6);
+        assert!(events.iter().any(|e| matches!(e, Event::Liquidated { .. })));
     }
 }

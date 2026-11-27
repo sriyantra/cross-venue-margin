@@ -103,6 +103,10 @@ impl Engine {
                     return Err(Reason::Deposit(*amount));
                 }
                 self.open_entry(*account)?.account.deposit(asset, *amount)?;
+                if let Ok(rule) = self.schedule.collateral(asset) {
+                    let market = rule.price().clone();
+                    self.exposed.entry(market).or_default().insert(*account);
+                }
             }
             Event::Filled {
                 account,
@@ -124,6 +128,10 @@ impl Engine {
                     }
                     self.orders.remove(order);
                 }
+                self.exposed
+                    .entry(market.clone())
+                    .or_default()
+                    .insert(*account);
                 let entry = self.open_entry(*account)?;
                 let fill = Position::new(*side, *size, *px)?;
                 let replayed = entry.account.apply_fill(market.clone(), fill)?;

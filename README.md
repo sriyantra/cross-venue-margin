@@ -1,6 +1,8 @@
 # cross-venue-margin
 
-One margin account across two venues.
+One margin account across Hyperliquid and OKX: one pool of collateral,
+hedged positions netted, and margin and liquidation prices that match
+Hyperliquid's own for 11 real accounts.
 
 A Rust service that keeps live order books and mark prices from Hyperliquid
 and OKX and runs a risk engine over accounts whose positions sit on both,
@@ -109,7 +111,11 @@ checked against its documented formula.
 Not modeled: fee tiers and maker fees, OKX's liquidation fee, a USDT/USD rate,
 offsets between different coins, the time it takes to move collateral
 between venues, staged liquidation, an insurance fund, and selling coin
-collateral. The haircuts and the hedge rate are my own numbers. Paper
+collateral. The haircuts and the hedge rate are my own numbers.
+[`study/`](study/README.md) checks the hedge rate against 208 days of
+prices from both venues: the gap between them never moved more than 19.3
+basis points in any window, against the 50 a hedged pair holds at
+maintenance. That period has no day on which one venue broke away. Paper
 fills do not move the book. Funding is charged on the mark, where
 Hyperliquid uses its oracle price, and a settlement that passes while the
 service is down is not charged afterwards.
@@ -183,6 +189,11 @@ and testnet is not mainnet.
 `/metrics` includes `feed_to_decision_seconds`, a histogram from a mark
 price frame being read off the socket to the engine having rechecked every
 account against it. It covers this process only, not the network path.
+
+The engine keeps, per market, the accounts its mark can change, so a mark
+costs what its holders cost. `cargo bench` on an Apple M5 Pro,
+100,000 accounts: 0.11 ms for a mark when 1 account in 100 holds the
+market (2.3 ms before the index), 12 ms when every account does.
 
 ## Tests
 
